@@ -1,0 +1,4 @@
+{
+  "_comment": "Copy to camera.local.json and fill in the real password. That file is gitignored.",
+  "rtsp": "rtsp://service:PASSWORD@192.168.1.105:554/?h26x=4&line=1&inst=1"
+}

@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "patlite-signal-tower"
+version = "1.0.0"
+description = "PATLITE 網路型信號燈 HTTP 命令控制程式庫（5.3.13 HTTP Command Reception Function）"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+patlite-console = "console_demo:main"
+
+[tool.setuptools]
+packages = ["patlite_signal_tower"]
+py-modules = ["console_demo"]

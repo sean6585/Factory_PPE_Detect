@@ -1,0 +1,24 @@
+{
+  "enabled": false,
+  "target": "tsmc-test",
+  "targets": {
+    "tsmc-test": {
+      "result_url": "http://192.168.12.30:9001/access-control-dashboard/ppe-result",
+      "heartbeat_url": "http://192.168.12.30:9001/ppe/device-heartbeat"
+    },
+    "mock": {
+      "result_url": "http://it-mock.test:8900/access-control-dashboard/ppe-result",
+      "heartbeat_url": "http://it-mock.test:8900/ppe/device-heartbeat"
+    }
+  },
+  "client_id": "Jetson-F20-L40-A-1",
+  "fab_area": "F20P3A-L40-A-1",
+  "heartbeat_interval_s": 30,
+  "verify_tls": false,
+  "timeout_s": 200,
+  "item_fields": {
+    "Hardhat": "helmet",
+    "Safety Harness": "harness",
+    "Bodycam": "bodyCam"
+  }
+}

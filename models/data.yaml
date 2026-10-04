@@ -1,0 +1,21 @@
+names:
+- Hardhat
+- Mask
+- NO-Hardhat
+- NO-Mask
+- NO-Safety Vest
+- Person
+- Safety Cone
+- Safety Vest
+- machinery
+- vehicle
+nc: 10
+roboflow:
+  license: CC BY 4.0
+  project: construction-site-safety
+  url: https://universe.roboflow.com/roboflow-universe-projects/construction-site-safety/dataset/28
+  version: 28
+  workspace: roboflow-universe-projects
+test: ../test/images
+train: ../train/images
+val: ../valid/images

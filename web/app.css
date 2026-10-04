@@ -1,0 +1,397 @@
+  :root{
+    --bg:#ffffff; --card:#eeeeee; --line:#c9c9c9; --fg:#4a4a4a; --muted:#8a8a8a;
+    --ok:#00b400; --ng:#e00000; --accent:#2b6cb0;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--fg);overflow:hidden;
+       font:16px/1.4 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;
+       display:flex;flex-direction:column}
+
+  /* Phase-1 test bar. Phase 2 replaces this with the RTSP + RFID trigger. */
+  #testbar{display:flex;align-items:center;gap:12px;padding:10px 18px;
+           background:#f3f4f6;border-bottom:1px solid var(--line);font-size:15px;flex-wrap:wrap}
+  #testbar.hidden{display:none}
+  #testbar label{color:var(--muted)}
+  #testbar input{border:1px solid var(--line);border-radius:6px;padding:7px 10px;
+                 font-size:15px;font-family:ui-monospace,Menlo,monospace;width:130px}
+  #testbar button{border:1px solid var(--line);background:#fff;border-radius:6px;
+                  padding:8px 14px;font-size:15px;cursor:pointer}
+  #testbar button:hover{border-color:var(--accent);color:var(--accent)}
+  #shutdownBtn{border-color:var(--ng)!important;color:var(--ng)}
+  #shutdownBtn:hover{background:var(--ng);color:#fff}
+  .tag{background:#e5e7eb;border-radius:20px;padding:3px 10px;font-size:12.5px;color:var(--muted)}
+
+  /* Area-threshold slider — hides small (background/far) Person boxes from the result
+     canvas. Sits right under the test bar and hides with it (press H). */
+  #areaBar, #rssiBar{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:8px 18px;
+           background:#fafafa;border-bottom:1px solid var(--line);font-size:13.5px}
+  #areaBar.hidden, #rssiBar.hidden{display:none}
+  #areaBar input[type=range], #rssiBar input[type=range]{flex:1;accent-color:var(--accent);
+           height:4px;cursor:pointer}
+  /* RSSI floor for the image trigger's one-person rule. Its own bar under the area
+     slider: same operator row family, but this one changes what the GATE does (which
+     tags count as "here"), not just what the picture shows. */
+  #rssiBar{padding-top:4px}
+  #rssiBar input[type=range]{max-width:420px}
+  #rssiHint{font-family:ui-monospace,Menlo,monospace}
+  .areaNum{font-family:ui-monospace,Menlo,monospace;color:#555;min-width:64px;
+           text-align:right;font-size:13px}
+  #areaMax{text-align:left}
+  .areaInput{width:96px;border:1px solid var(--line);border-radius:6px;padding:3px 6px;
+             font-size:13px;font-family:ui-monospace,Menlo,monospace;text-align:right}
+  .areaInput:focus{outline:none;border-color:var(--accent)}
+  /* "show all predictions" toggle + a tiny colour legend, in the same operator bar as
+     the area slider since both decide what boxes appear on the picture. */
+  .tag.chk{display:inline-flex;align-items:center;gap:6px;cursor:pointer;color:var(--fg)}
+  .tag.chk input{margin:0;accent-color:var(--accent)}
+  .tag.legend{display:inline-flex;align-items:center;gap:6px}
+  .legend .sw{display:inline-block;width:14px;height:0;border-top:3px solid;margin:0 2px 0 6px}
+  .legend .sw.pred{border-color:#2b6cb0;border-top-style:dashed}
+  .legend .sw.veto{border-color:var(--ng);border-top-style:dashed}
+  .legend .sw.by{border-color:#6b7280}
+
+  /* Through-beam sensor's raw DI level, from the RFID box's GPIO input(s). Neutral
+     styling on purpose — HIGH/LOW isn't yet known to mean "beam broken" vs "clear"
+     (wiring polarity unconfirmed), so this reports the signal, not a verdict. */
+  #diBar{display:flex;align-items:center;gap:12px;padding:6px 18px;
+         background:#fafafa;border-top:1px solid var(--line);font-size:13px}
+  #diBar.hidden{display:none}
+  /* ON is the expected, unremarkable state (the gate is watching, as intended); OFF is
+     the one worth noticing — a safety trigger someone turned off is the deviation, not
+     the norm — so unlike #rtBtn.on this colours the OFF state, not the ON one. */
+  .trig{border:1px solid var(--line);background:#fff;border-radius:6px;
+        padding:4px 10px;font-size:12.5px;cursor:pointer;
+        font-family:ui-monospace,Menlo,monospace}
+  .trig:hover{border-color:var(--accent);color:var(--accent)}
+  .trig.off{border-color:var(--ng)!important;color:var(--ng);font-weight:700}
+  .trig.hidden{display:none}
+  /* The image trigger is the default, so unlike the sensor its ON state is what a
+     glance should confirm: green border while it is actually watching frames. */
+  #itToggle.on{border-color:var(--ok)!important;color:var(--ok);font-weight:700}
+  #itState{font-family:ui-monospace,Menlo,monospace}
+  #itState.hidden, #diState.hidden{display:none}
+  #itState.armed{color:#b45309}   /* a person is in the area and the dwell is counting */
+  /* IT reporting: quiet when healthy, red when a report or heartbeat is failing — a
+     silent upload failure is exactly what this tag exists to make visible. */
+  #itRep{font-family:ui-monospace,Menlo,monospace}
+  #itEnable.on{border-color:var(--ok)!important;color:var(--ok);font-weight:700}
+  #itRep.bad{color:var(--ng);font-weight:700}
+  #itRep.good{color:var(--ok)}
+
+  main{flex:1;display:flex;gap:34px;padding:26px 34px;min-height:0}
+  /* imgCol carries the flex-basis that #imgPanel alone used to have, so the pause
+     bar sits directly under the video without disturbing the imgPanel/side ratio. */
+  #imgCol{flex:0 0 52%;display:flex;flex-direction:column;gap:10px;min-height:0}
+  #imgPanel{flex:1;background:var(--card);border-radius:16px;position:relative;
+            display:flex;align-items:center;justify-content:center;padding:14px;min-height:0}
+  canvas{max-width:100%;max-height:100%;object-fit:contain;display:none}
+  canvas.ready{display:block}
+  #live{max-width:100%;max-height:100%;object-fit:contain;display:none;border-radius:8px}
+  #live.on{display:block}
+  #toLive{position:absolute;top:16px;right:16px;z-index:3;border:1px solid var(--line);
+          background:#fff;border-radius:8px;padding:8px 14px;font-size:14px;cursor:pointer;display:none}
+  #toLive.on{display:block}
+  #toLive:hover{border-color:var(--accent);color:var(--accent)}
+  /* Shown in place of the video while the feed is paused — same spot #imgHint uses,
+     so the panel is never just a blank grey box. */
+  #livePaused{display:none;color:var(--muted);font-size:15px}
+  #livePaused.on{display:block}
+  /* Door-zone overlay: two vertical edges plus a light shade outside them, sitting on
+     whichever picture is showing (live <img> or the result <canvas>). Plain positioned
+     DOM, moved only when a handle is dragged or the picture's box changes — never per
+     frame — so it costs the live feed nothing. */
+  #zoneOverlay{position:absolute;pointer-events:none;display:none;z-index:2}
+  #zoneOverlay.on{display:block}
+  /* Walking track, drawn over whichever picture is showing. Its own canvas rather than
+     the result canvas (#cv): that one is redrawn only when a check completes, while this
+     updates on every status poll and must not disturb it. */
+  #trackCv{position:absolute;pointer-events:none;display:none;z-index:3}
+  #trackCv.on{display:block}
+  .zoneShade{position:absolute;top:0;bottom:0;background:rgba(15,15,15,.28)}
+  .zoneEdge{position:absolute;top:0;bottom:0;width:0;border-left:3px dashed #f59e0b;
+            margin-left:-1.5px}
+  .zoneEdge::after{content:"";position:absolute;top:0;left:-6px;width:12px;height:12px;
+                   background:#f59e0b;border-radius:0 0 3px 3px}
+  /* Names the door's side of the picture (door_side), so a wrong setting is visible the
+     moment a worker walks to the door the other way. */
+  .doorMark{position:absolute;top:8px;padding:2px 8px;border-radius:4px;font-size:13px;
+            font-weight:700;color:#fff;background:rgba(185,28,28,.8);white-space:nowrap}
+  .doorMark.left{left:8px}
+  .doorMark.right{right:8px}
+
+  /* Door-zone bar under the picture: one track, two handles ( ----I--------I---- ).
+     Not native <input type=range>: two of those can't share a track without one
+     covering the other, and the "thumb-only pointer-events" workaround proved
+     ungrabbable with a real mouse. This is a plain div with pointer events on the
+     WHOLE bar — press anywhere and the nearest edge comes to the pointer, so the hit
+     target is the full width, not a 10px thumb. Arrow keys nudge a focused handle. */
+  #zoneBar{flex:0 0 auto;display:flex;align-items:center;gap:10px;font-size:13.5px}
+  #zoneBar.hidden{display:none}
+  .dual{position:relative;flex:1;height:30px;min-width:120px;cursor:pointer;
+        touch-action:none;user-select:none}
+  .dualTrack{position:absolute;left:0;right:0;top:13px;height:4px;border-radius:2px;
+             background:#d4d4d8;pointer-events:none}
+  .dualFill{position:absolute;top:0;bottom:0;background:#f59e0b;border-radius:2px}
+  .dualHandle{position:absolute;top:0;width:14px;height:30px;margin-left:-7px;
+              border-radius:4px;background:#f59e0b;border:2px solid #fff;
+              box-shadow:0 0 0 1px #b45309;cursor:ew-resize;box-sizing:border-box}
+  .dualHandle:hover, .dual.dragging .dualHandle.active{background:#d97706}
+  .dualHandle:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  /* Fixed widths: these labels change text while a handle is being dragged, and a
+     label that grows would shrink the flex bar and pull it out from under the cursor. */
+  #zoneVal{min-width:100px;text-align:center}
+  #zoneHint{min-width:186px;text-align:center}
+  #liveToggleBar{flex:0 0 auto;display:flex;align-items:center;gap:10px}
+  #liveToggleBar.hidden{display:none}   /* swapped out for #pbBar during folder playback */
+  #liveToggle{border:1px solid var(--line);background:#fff;border-radius:6px;
+              padding:8px 14px;font-size:14px;cursor:pointer}
+  #liveToggle:hover{border-color:var(--accent);color:var(--accent)}
+  #liveToggle.paused{border-color:var(--ng)!important;color:var(--ng);font-weight:600}
+  /* Folder playback transport. Takes the pause bar's place under the picture while a
+     folder is playing (the live feed is stopped for the duration anyway). */
+  #pbBar{flex:0 0 auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  #pbBar.hidden{display:none}
+  #pbBar button{border:1px solid var(--line);background:#fff;border-radius:6px;
+                padding:6px 12px;font-size:15px;cursor:pointer;line-height:1}
+  #pbBar button:hover{border-color:var(--accent);color:var(--accent)}
+  #pbBar button:disabled{color:var(--muted);background:#f3f4f6;cursor:default}
+  #pbBar select{border:1px solid var(--line);border-radius:6px;padding:5px 8px;font-size:13px}
+  #pbPos{font-family:ui-monospace,Menlo,monospace;color:#555}
+  .pbName{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+          font-family:ui-monospace,Menlo,monospace}
+  #pbStop{border-color:var(--ng)!important;color:var(--ng)}
+  #camState{font-size:12.5px}
+  #camState.up{color:var(--ok)} #camState.down{color:var(--ng)}
+  #cap{border:1px solid var(--accent)!important;color:var(--accent);font-weight:600}
+  #trigger{margin-top:20px;width:100%;padding:22px;border:none;border-radius:16px;
+           background:var(--accent);color:#fff;font-size:27px;font-weight:800;cursor:pointer;
+           letter-spacing:.6px;transition:filter .1s}
+  #trigger:hover{filter:brightness(1.08)}
+  #trigger:active{transform:translateY(1px)}
+  #trigger:disabled{background:#b8c4d4;cursor:default;filter:none}
+  #imgHint{color:var(--muted);font-size:17px;text-align:center}
+
+  #side{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0}
+  #items{display:flex;flex-direction:column;gap:16px}
+  #personRow{margin-bottom:14px;padding:8px 12px;background:var(--card);border-radius:10px}
+  #personRow input[type=range]{flex:1;min-width:80px;max-width:150px;accent-color:var(--accent);
+                              height:4px;cursor:pointer}
+  #personRow input[type=number]{width:62px;border:1px solid var(--line);border-radius:6px;
+                               padding:3px 6px;font-size:13px;
+                               font-family:ui-monospace,Menlo,monospace}
+  #personRow input:disabled{color:var(--muted);background:#f3f4f6;cursor:default}
+  #personRow .trackBreak{flex-basis:100%;height:0}
+  #exitFrac,#awayFrac{width:70px}
+  #recPager{display:flex;align-items:center;gap:8px}
+  #recPager button{border:1px solid var(--line);background:#fff;border-radius:6px;
+                  padding:3px 10px;font-size:12.5px;cursor:pointer}
+  #recPager button:disabled{color:var(--muted);background:#f3f4f6;cursor:default}
+  .item{background:var(--card);border-radius:14px;display:flex;align-items:center;
+        justify-content:space-between;padding:14px 18px 14px 26px;gap:16px}
+  .item .name{font-size:30px;color:#555}
+  /* Inline rename of an item's heading. The pencil stays faint until the card is
+     hovered so the kiosk reading of the name isn't cluttered; the editor reuses the
+     heading's own size so the text doesn't jump when it swaps in. */
+  .nameRow{display:flex;align-items:center;gap:8px;min-width:0}
+  .editName{border:1px solid var(--line);background:#fff;border-radius:6px;padding:2px 8px;
+            font-size:16px;line-height:1;cursor:pointer;color:var(--muted);opacity:.45}
+  .item:hover .editName{opacity:1}
+  .editName:hover{border-color:var(--accent);color:var(--accent)}
+  .editName:disabled{opacity:.2;cursor:default}
+  .nameInput{font-size:30px;color:#555;border:2px solid var(--accent);border-radius:8px;
+             padding:0 8px;min-width:0;width:100%;max-width:340px;background:#fff}
+
+  /* "Judge this item?" switch. A real checkbox underneath (keyboard/a11y for free),
+     drawn as a slider. Green when the item counts toward PASS/FAIL, grey when it is
+     evaluated-but-ignored. Sits at full opacity even when the card is dimmed, so the
+     way back ON is always obvious. */
+  .judge{position:relative;display:inline-flex;align-items:center;gap:6px;cursor:pointer;
+         font-size:12px;color:var(--muted);user-select:none;opacity:1!important}
+  .judge input{position:absolute;opacity:0;width:0;height:0}
+  .judge .track{width:38px;height:22px;border-radius:11px;background:#c9c9c9;position:relative;
+                transition:background .15s;flex:0 0 auto}
+  .judge .track::after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;
+                       border-radius:50%;background:#fff;transition:left .15s;
+                       box-shadow:0 1px 2px rgba(0,0,0,.25)}
+  .judge input:checked + .track{background:var(--ok)}
+  .judge input:checked + .track::after{left:19px}
+  .judge input:focus-visible + .track{outline:2px solid var(--accent);outline-offset:2px}
+  .judge input:disabled + .track{opacity:.4;cursor:default}
+  /* A switched-off item stays visible (the operator should still see what the model
+     saw) but clearly out of the running. */
+  .item.off .name, .item.off .remap, .item.off .badge, .item.off .votes{opacity:.38}
+  .item.off .badge{background:#f0f0f0;color:#999}
+  .item.off .badge.off{font-size:16px;letter-spacing:.5px}
+  .itemLeft{display:flex;flex-direction:column;gap:6px;min-width:0}
+  .remap{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .remap label{font-size:11.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
+  .remap select{border:1px solid var(--line);border-radius:6px;padding:3px 7px;
+               font-size:13px;font-family:ui-monospace,Menlo,monospace;background:#fff;
+               max-width:180px}
+  .remap select:disabled{color:var(--muted);background:#f3f4f6;cursor:default}
+  .confRow{display:flex;align-items:center;gap:8px}
+  .confRow input[type=range]{flex:1;min-width:90px;max-width:190px;accent-color:var(--accent);
+                            height:4px;cursor:pointer}
+  .confRow input[type=number]{width:62px;border:1px solid var(--line);border-radius:6px;
+                             padding:3px 6px;font-size:13px;
+                             font-family:ui-monospace,Menlo,monospace}
+  .confRow input:disabled{color:var(--muted);background:#f3f4f6;cursor:default}
+  .badge{min-width:118px;height:74px;border:1px solid #9a9a9a;border-radius:12px;
+         background:#fff;display:flex;align-items:center;justify-content:center;
+         font-size:30px;font-weight:800;letter-spacing:.5px}
+  .badge.ok{color:var(--ok)} .badge.ng{color:var(--ng)} .badge.idle{color:#b0b0b0}
+  .votes{font-size:13px;color:var(--muted);font-family:ui-monospace,Menlo,monospace;
+         margin-top:5px;text-align:right}
+
+  /* Why the gate spoke. Sits under the checklist because that is where the eye already
+     is when a worker is told something — the items say WHAT is wrong, this says what
+     the gate just announced, in the same words the speaker used. Colour follows the
+     announcement, not the PPE verdict: a crowd refusal is red even though no item failed. */
+  #alarmBox{margin-top:18px;border:2px solid var(--line);border-radius:14px;
+            padding:14px 18px;background:var(--card)}
+  #alarmBox.alarm{border-color:var(--ng);background:#fdeaea}
+  #alarmBox.ok{border-color:var(--ok);background:#e9f7e9}
+  #alarmBox.idle{border-style:dashed}
+  .alarmRow{display:flex;align-items:center;gap:14px}
+  .alarmTexts{flex:1;min-width:0}
+  #alarmDot{width:16px;height:16px;border-radius:50%;background:#c9c9c9;flex:0 0 auto}
+  #alarmBox.alarm #alarmDot{background:var(--ng)}
+  #alarmBox.ok #alarmDot{background:var(--ok)}
+  #alarmMain{font-size:27px;font-weight:800;color:#555;line-height:1.2}
+  #alarmBox.alarm #alarmMain{color:var(--ng)}
+  #alarmBox.ok #alarmMain{color:var(--ok)}
+  #alarmSub{font-size:14px;color:var(--muted);margin-top:3px}
+  #alarmWhen{font-family:ui-monospace,Menlo,monospace;flex:0 0 auto;align-self:flex-start}
+
+  #summary{margin-top:auto;padding-top:22px;font-size:30px}
+  #summary .lab{font-weight:800;color:#555}
+  #summary .val{color:#333}
+  #verdict{font-weight:800}
+  #verdict.pass{color:var(--ok)} #verdict.fail{color:var(--ng)}
+  #verdict.idle{color:#b0b0b0}
+  #warn{margin-top:12px;color:#b45309;font-size:15px}
+  #err{color:var(--ng);font-size:15px;margin-top:10px}
+  #modelBtn, #recordsBtn, #rfidBtn, #rtBtn{font-family:ui-monospace,Menlo,monospace;font-size:13px}
+  /* RFID reads table: rows above the one-person threshold are the ones the image
+     trigger counts, so they get the verdict-green pill; the rest are "heard, ignored". */
+  .pill.near{background:#e5f7e5;color:var(--ok)}
+  .pill.far{background:#f0f0f0;color:#999}
+  table.recTable td.num{font-family:ui-monospace,Menlo,monospace;text-align:right}
+  table.recTable td.epc{font-family:ui-monospace,Menlo,monospace}
+  #rtBtn.on{border-color:var(--ng)!important;color:var(--ng);font-weight:700}
+  #rtInfo{display:none}
+  #rtInfo.on{display:inline-block}
+  .sheet.wide{width:min(1150px,95vw)}
+  .recWrap{overflow:auto;max-height:60vh;border:1px solid var(--line);border-radius:10px}
+  table.recTable{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}
+  table.recTable th{position:sticky;top:0;background:#f3f4f6;text-align:left;
+                    padding:8px 11px;border-bottom:1px solid var(--line);z-index:1}
+  table.recTable td{padding:6px 11px;border-bottom:1px solid #eee}
+  table.recTable tr:hover td{background:#fafbfc}
+  .pill{border-radius:20px;padding:1px 9px;font-size:11.5px;font-weight:700;letter-spacing:.2px}
+  .pill.ok{background:#e5f7e5;color:var(--ok)} .pill.ng{background:#fdeaea;color:var(--ng)}
+  .alarmPill{border-radius:6px;padding:2px 8px;font-size:12.5px;font-weight:700;white-space:nowrap}
+  .alarmPill.ok{background:#e5f7e5;color:var(--ok)} .alarmPill.ng{background:#fdeaea;color:var(--ng)}
+  .votes{color:var(--muted);font-family:ui-monospace,Menlo,monospace;font-size:11px;margin-left:4px}
+  /* Speaker test: the tower's own Mute box. A muted tower takes every command and stays
+     silent, so the state is shown in red for as long as it holds, not just once. */
+  #towerModal .muteLabel{display:inline-flex;align-items:center;gap:5px;cursor:pointer;
+                        flex:none;width:auto;white-space:nowrap}
+  #towerModal .muteLabel input{margin:0;padding:0;flex:none;width:auto;min-width:0}
+  #towerVolState.muted{color:var(--ng);font-weight:700}
+  /* Records: the item's own score under its pill, and the badges the reader heard. */
+  .score{display:block;margin-top:2px;color:var(--muted);font-family:ui-monospace,Menlo,monospace;
+         font-size:11px}
+  .score .neg{color:var(--ng)}
+  .tagList{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.5}
+  table.recTable .mono{font-family:ui-monospace,Menlo,monospace;font-size:12px}
+  .tagList .weak{color:var(--muted)}
+  .viewBtn{border:1px solid var(--line);background:#fff;border-radius:6px;padding:3px 10px;
+           font-size:12px;cursor:pointer}
+  .viewBtn:hover{border-color:var(--accent);color:var(--accent)}
+  #recFoot{display:flex;justify-content:space-between;align-items:center;margin-top:12px;
+           font-size:12.5px;color:var(--muted)}
+  #lightbox{position:fixed;inset:0;background:rgba(15,15,15,.78);display:none;
+            align-items:center;justify-content:center;z-index:30;cursor:zoom-out;padding:24px}
+  #lightbox.on{display:flex}
+  #lightbox img{max-width:100%;max-height:100%;border-radius:6px;box-shadow:0 12px 40px rgba(0,0,0,.5)}
+  #modelModal, #recordsModal, #rfidModal, #towerModal{position:fixed;inset:0;background:rgba(20,20,20,.45);
+                             display:none;align-items:center;justify-content:center;z-index:20}
+  #modelModal.on, #recordsModal.on, #rfidModal.on, #towerModal.on{display:flex}
+  .sheet{background:#fff;border-radius:14px;padding:22px 24px;width:min(720px,92vw);
+         max-height:82vh;overflow:auto;box-shadow:0 18px 50px rgba(0,0,0,.25)}
+  .sheetHead{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
+  .sheet h3{margin:0 0 4px;font-size:21px;color:#333}
+  .sheet .sub{color:var(--muted);font-size:13px;font-family:ui-monospace,Menlo,monospace;
+              margin-bottom:16px;word-break:break-all}
+  .mrow{display:flex;align-items:center;flex-wrap:wrap;gap:14px;padding:12px 14px;
+       border:1px solid var(--line);border-radius:10px;margin-bottom:9px;cursor:pointer;
+       background:#fff}
+  .mrow:hover{border-color:var(--accent)}
+  .mrow.active{border-color:var(--ok);background:#f3fbf3;cursor:default}
+  .mrow.busy{opacity:.5;cursor:progress;pointer-events:none}
+  .mrow .f{font-family:ui-monospace,Menlo,monospace;font-size:15px;color:#333;flex:1}
+  .mrow .meta{font-size:12.5px;color:var(--muted);white-space:nowrap}
+  .yamlRow{flex-basis:100%;display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+           font-size:12px;color:var(--muted);padding-top:6px;border-top:1px dashed var(--line);
+           cursor:default}
+  .yamlRow .cls{font-family:ui-monospace,Menlo,monospace;background:#f3f4f6;border-radius:4px;
+               padding:1px 6px}
+  .yamlBtn{border:1px solid var(--line);background:#fff;border-radius:6px;padding:2px 9px;
+          font-size:11.5px;cursor:pointer;color:#555}
+  .yamlBtn:hover{border-color:var(--accent);color:var(--accent)}
+  .yamlWarn{color:#b45309}
+  .fmt{border-radius:5px;padding:2px 8px;font-size:11.5px;background:#e5e7eb;color:#555;
+       font-family:ui-monospace,Menlo,monospace}
+  .sheetActions{display:flex;align-items:center;gap:12px;margin-bottom:18px;flex-wrap:wrap}
+  .sheetActions button{border:1px solid var(--accent);background:#fff;color:var(--accent);
+                       border-radius:8px;padding:9px 16px;font-size:15px;cursor:pointer;font-weight:600}
+  .sheetActions button:hover{filter:brightness(.95)}
+  .sheetActions button:disabled{border-color:var(--line);color:var(--muted);cursor:default}
+  .sheetActions input{border:1px solid var(--line);border-radius:8px;padding:8px 12px;
+                      font-size:14px;font-family:ui-monospace,Menlo,monospace;
+                      min-width:220px;flex:0 1 260px}
+  .sheetActions input:focus{outline:none;border-color:var(--accent)}
+  .sheetActions .chk input{min-width:0;flex:none;padding:0;border:none}
+  #recEmpty{color:var(--muted);padding:14px 4px}
+  #modelNote{font-size:13px;color:var(--muted);margin-top:14px;line-height:1.55}
+  #modelNote code{background:#f1f2f4;border-radius:4px;padding:1px 5px;font-size:12px}
+  #modelErr{color:var(--ng);font-size:14px;margin-top:10px;white-space:pre-wrap}
+  #busy{position:fixed;inset:0;display:none;align-items:center;justify-content:center;
+        background:rgba(255,255,255,.72);font-size:20px;color:var(--muted);z-index:9}
+  #busy.on{display:flex}
+
+  /* Speaker test popup (PATLITE tower). */
+  .towerLab{font-size:13px;color:var(--muted);margin:4px 0 8px}
+  #towerText{flex:1 1 260px;font-family:inherit;font-size:15px}
+  #towerLang{border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:14px}
+  .lampBtn{min-width:96px}
+  .sheetActions .lampBtn.red{border-color:#d32f2f;color:#d32f2f}
+  .sheetActions .lampBtn.amber{border-color:#d49a00;color:#a87a00}
+  .sheetActions .lampBtn.green{border-color:#1f9d3a;color:#1f9d3a}
+  .sheetActions .lampBtn.red:hover{background:#d32f2f;color:#fff}
+  .sheetActions .lampBtn.amber:hover{background:#f2b600;color:#fff}
+  .sheetActions .lampBtn.green:hover{background:#1f9d3a;color:#fff}
+  #dirSource,#doorSide{border:1px solid var(--line);border-radius:6px;padding:4px 8px;font-size:13px;background:#fff;font-weight:600}
+  .dirLabel{cursor:help;white-space:nowrap}
+  .lightTag{white-space:nowrap}
+  #itTarget{border:1px solid var(--line);border-radius:6px;padding:4px 8px;font-size:13px;background:#fff}
+  #itTarget.mockTarget{border-color:#d49a00;background:#fdf1d6;color:#8a6100;font-weight:700}
+  .lightTag.green{background:#e3f6e6;color:#1b7f35}
+  .lightTag.yellow{background:#fdf1d6;color:#8a6100}
+  .lightTag.red{background:#fde8e6;color:#c62828}
+  .lightTag.flash{font-weight:700}
+  @media (prefers-reduced-motion:no-preference){
+    .lightTag.flash{animation:lampBlink 1s steps(2,start) infinite}
+  }
+  @keyframes lampBlink{to{opacity:.35}}
+  .pill.unreg{background:#fde8e6;color:#c62828}
+  .rfidSet{font-size:14px}
+  .rfidSet input[type=number]{min-width:0;flex:0 0 80px}
+  .rfidSet select{border:1px solid var(--line);border-radius:8px;padding:7px 9px;font-size:14px}
+  #towerVol{flex:1 1 220px;accent-color:var(--accent)}
+  #towerVolState:empty{display:none}
+  #towerMsg{font-size:14px;min-height:1.4em;color:var(--muted)}
+  #towerMsg.ok{color:var(--ok)}
+  #towerMsg.bad{color:var(--ng);white-space:pre-wrap}

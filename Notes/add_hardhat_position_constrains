@@ -1,0 +1,9 @@
+Implemented, off by default, with cy logged everywhere.
+
+How to enable it
+
+Stop the gate, add one field to the item in config/gate.json, restart:
+
+{ "label": "Hardhat", "classes": ["Hardhat"], "negatives": ["NO-Hardhat"],
+  "conf": 0.4,
+  "max_center_y": 0.35 }

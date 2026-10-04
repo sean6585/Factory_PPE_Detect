@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PPE Check</title>
+<link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/demo.css">
+</head>
+<body>
+
+<div id="testbar">
+  <button id="cap">&#9673; Check Now (live)</button>
+  <span class="tag" id="camState">camera: &hellip;</span>
+  <button id="modelBtn" title="Browse and switch the detection model">&#9881; model: <span id="modelName">&hellip;</span></button>
+  <button id="recordsBtn" title="Every gate trigger, from captures.csv">&#128203; See Records</button>
+  <button id="rfidBtn" title="Every RFID tag the reader has heard recently: ID, signal strength, time">&#128225; See RFID read</button>
+  <button id="towerBtn" title="Make the PATLITE tower speak a line or flash one lamp">&#128266; Speaker test</button>
+  <button id="demoBtn" title="Full-screen view for visitors: the camera, each item OK / NG, the badge and the alarm. Everything here keeps running underneath.">&#128250; 大字報</button>
+  <button id="rtBtn" title="Continuous detection; harvests training frames while it runs">&#9673; Realtime: off</button>
+  <span class="tag" id="rtInfo"></span>
+  <span style="width:14px"></span>
+  <button id="pick">Choose image(s)&hellip;</button>
+  <input type="file" id="file" accept="image/*" multiple hidden>
+  <button id="playFolder" title="Pick a folder of images; each one is inferred and shown in turn, like a video. Nothing is announced or recorded.">&#9654; Play folder&hellip;</button>
+  <input type="file" id="folder" webkitdirectory directory multiple hidden>
+  <span class="tag" id="burstInfo"></span>
+  <span style="flex:1"></span>
+  <span class="tag">live burst from the Bosch camera &middot; or upload images to test &middot; press H to hide</span>
+  <button id="shutdownBtn" title="Stop the gate server process. systemd restarts it within a few seconds.">&#9211; Shut down</button>
+</div>
+
+<div id="areaBar">
+  <span class="tag">Filter background people &mdash; hide any not-primary Person below</span>
+  <input type="number" id="areaNum" class="areaInput" min="0" step="100" value="10000"
+         title="Type an exact px² value — Enter or click away to save">
+  <input type="range" id="areaSlider" min="0" max="1228800" step="100" value="10000">
+  <span id="areaMax" class="areaNum"></span>
+  <span class="tag">px&sup2;</span>
+  <label class="tag" for="exitFrac" title="A worker coming out of the door is side-on, so their box is smaller. A track that came from the door's side starts its 出場 visit at this fraction of the area threshold; everyone else needs the full threshold. Saved in gate.json.">出場（門那側來）&times;</label>
+  <input type="number" id="exitFrac" class="areaInput" min="0.2" max="1" step="0.05" value="0.60"
+         title="0.2 – 1.0 · Enter or click away to save">
+  <span class="tag" id="exitFracPx">&hellip;</span>
+  <label class="tag" for="awayFrac" title="A visit's box shrinking below this fraction of the area threshold (held 0.3 s) counts as walking away from the camera: the way out for 出場, turning back for 進場. Higher = reported sooner, but above ~0.7 a worker turning side-on to the door (box ~55-65 % of front-on) may read as walking away. 0.5 suits a long approach path. Saved in gate.json.">走遠線 &times;</label>
+  <input type="number" id="awayFrac" class="areaInput" min="0.3" max="0.8" step="0.05" value="0.50"
+         title="0.3 – 0.8 · Enter or click away to save">
+  <span class="tag" id="awayFracPx">&hellip;</span>
+  <span style="width:14px"></span>
+  <label class="tag chk" title="Also draw every prediction the checklist did NOT judge: PPE on other people, NO-* classes, anything else above its threshold. Bypasses the area filter. Dashed blue = prediction only, not a verdict.">
+    <input type="checkbox" id="showAll"> show all predictions
+  </label>
+  <label class="tag chk" title="Draw the path the watched person has walked over the last few seconds, with an arrow for the direction. Crossing the LEFT edge counts as entering.">
+    <input type="checkbox" id="showTrack"> show walking track
+  </label>
+  <span class="tag legend"><i class="sw pred"></i>prediction <i class="sw veto"></i>veto <i class="sw by"></i>other person</span>
+</div>
+
+<div id="rssiBar">
+  <span class="tag" title="Image trigger: only tags at least this strong count as a person AT the gate. Exactly one such tag = one worker, the check runs. None = RFID_fail.mp3. Two or more = multi-person-detected.mp3 and the gate waits.">RFID one-person threshold &mdash; a tag must be at least this strong to count</span>
+  <span id="rssiVal" class="areaNum">&minus;60</span>
+  <input type="range" id="rssiSlider" min="-100" max="0" step="1" value="-60">
+  <span class="tag">dBm</span>
+  <span class="tag" id="rssiHint"></span>
+</div>
+
+<main>
+  <div id="imgCol">
+    <div id="imgPanel">
+      <img id="live" alt="live camera">
+      <canvas id="cv"></canvas>
+      <div id="zoneOverlay">
+        <div class="zoneShade" id="zoneShadeL"></div>
+        <div class="zoneShade" id="zoneShadeR"></div>
+        <div class="zoneEdge" id="zoneEdgeL"></div>
+        <div class="zoneEdge" id="zoneEdgeR"></div>
+        <div class="doorMark" id="doorMark">門 · 管制區</div>
+      </div>
+      <canvas id="trackCv"></canvas>
+      <button id="toLive">&#9654; Back to live</button>
+      <div id="imgHint">Waiting for a check&hellip;</div>
+      <div id="livePaused">&#9208; Live view paused</div>
+    </div>
+    <div id="zoneBar">
+      <span class="tag" title="Image trigger: the largest person's box centre must sit between these two edges (the door) as well as being big enough, for the dwell time, before a check fires. Edges are a fraction of the frame width, so they hold at any resolution.">Door zone</span>
+      <div class="dual" id="zoneDual" title="Press anywhere on the bar: the nearest edge jumps there and follows the mouse. Arrow keys nudge a focused edge.">
+        <div class="dualTrack"><div class="dualFill" id="zoneFill"></div></div>
+        <div class="dualHandle" id="zoneHL" tabindex="0" role="slider" aria-label="left edge of the door zone"></div>
+        <div class="dualHandle" id="zoneHR" tabindex="0" role="slider" aria-label="right edge of the door zone"></div>
+      </div>
+      <span class="areaNum" id="zoneVal">0% &ndash; 100%</span>
+      <span class="tag" id="zoneHint">whole frame</span>
+      <label class="tag dirLabel" for="doorSide" title="Which side of the CAMERA IMAGE the door into the restricted area is on. Came from that side = 出場; leaving the zone towards it = going in. The camera faces the worker, so the floor plan's left is usually the picture's right — check by watching a worker walk to the door on the live view. Saved in gate.json.">門在畫面</label>
+      <select id="doorSide">
+        <option value="left">&#9664; 左</option>
+        <option value="right">右 &#9654;</option>
+      </select>
+    </div>
+    <div id="liveToggleBar">
+      <button id="liveToggle">&#9208; Pause live view</button>
+      <span class="tag">stops the browser decoding the video feed &mdash; CAPTURE &amp; CHECK and the sensor trigger still work</span>
+    </div>
+    <div id="pbBar" class="hidden">
+      <button id="pbPrev" title="Previous frame (&larr;)">&#9198;</button>
+      <button id="pbPlay" title="Play / pause (space)">&#9208;</button>
+      <button id="pbNext" title="Next frame (&rarr;)">&#9197;</button>
+      <select id="pbFps" title="Playback speed">
+        <option value="1">1 fps</option><option value="2">2 fps</option>
+        <option value="5" selected>5 fps</option><option value="10">10 fps</option>
+        <option value="0">as fast as inference allows</option>
+      </select>
+      <span id="pbPos" class="tag"></span>
+      <span id="pbName" class="tag pbName"></span>
+      <span style="flex:1"></span>
+      <button id="pbStop" title="Stop and return to the live view (Esc)">&#9632; Stop</button>
+    </div>
+  </div>
+
+  <div id="side">
+    <div id="personRow" class="remap">
+      <label>Worker class</label>
+      <select id="personSel"></select>
+      <label>Score &ge;</label>
+      <input type="range" id="personConfRange" min="0" max="1" step="0.01" value="0.40">
+      <input type="number" id="personConfNum" min="0" max="1" step="0.01" value="0.40">
+      <span class="tag">who the checklist is judged on</span>
+      <span class="trackBreak"></span>
+      <label for="trackConfRange">Tracking &ge;</label>
+      <input type="range" id="trackConfRange" min="0.05" max="1" step="0.01" value="0.60">
+      <input type="number" id="trackConfNum" min="0.05" max="1" step="0.01" value="0.60">
+      <span class="tag" id="trackHint" title="The in/out tracker keeps following a person down to this score, so a worker walking away or turning their back keeps the same ID. Only boxes at the Score above count as someone at the gate or can start a visit. Never higher than Score.">keeps following a worker walking off</span>
+    </div>
+    <div id="items"></div>
+    <div id="alarmBox" class="idle">
+      <div class="alarmRow">
+        <span id="alarmDot"></span>
+        <div class="alarmTexts">
+          <div id="alarmMain">待命中</div>
+          <div id="alarmSub">等待人員進入閘門</div>
+        </div>
+        <span class="tag" id="alarmWhen"></span>
+      </div>
+    </div>
+    <div id="warn"></div>
+    <div id="err"></div>
+    <div id="summary">
+      <div><span class="lab">Worker ID:</span> <span class="val" id="worker">—</span></div>
+      <div><span class="lab">PPE Check:</span> <span id="verdict" class="idle">—</span></div>
+    </div>
+    <button id="trigger">CAPTURE &amp; CHECK</button>
+  </div>
+</main>
+
+<div id="diBar">
+  <button id="itToggle" class="trig" title="When on, the largest person standing close (box above the area threshold) for the dwell time fires the same check as CAPTURE &amp; CHECK — after the RFID one-person rule">Image Trigger: &hellip;</button>
+  <span class="tag" id="itState">&hellip;</span>
+  <span style="width:14px"></span>
+  <button id="itEnable" class="trig" title="Send PPE results and the device heartbeat to the site IT service. Saved — survives a restart.">IT Report: &hellip;</button>
+  <select id="itTarget" title="Where IT reports go: the site's service, or the mock receiver on this box (scripts/it_mock.py, port 8900). Saved — survives a restart." hidden></select>
+  <span class="tag" id="itRep" title="IT reporting: PPE results and the device heartbeat">IT: &hellip;</span>
+  <span style="width:14px"></span>
+  <label class="tag dirLabel" for="dirSource" title="Who decides whether a worker is entering or leaving. IT 回報: the IT service's access_type in its reply to the PASS. 軌跡方向: our own bbox track (where the worker came from). 擅自闖入 / 闖出 are judged by the gate either way; what is sent to IT does not change. Saved in gate.json.">進出場判斷</label>
+  <select id="dirSource">
+    <option value="it">IT 回報</option>
+    <option value="track">軌跡方向</option>
+  </select>
+  <span class="tag" id="dirHint" hidden></span>
+  <span style="width:14px"></span>
+  <span class="tag lightTag" id="lightState" title="What the tower light is showing now, as the gate drives it">light: &hellip;</span>
+  <span style="width:14px"></span>
+  <span class="tag" id="diState">Digital Input: &hellip;</span>
+  <button id="sensorToggle" class="trig" title="When on, a beam break fires the same check as CAPTURE &amp; CHECK">Sensor Trigger: &hellip;</button>
+</div>
+
+<div id="modelModal">
+  <div class="sheet">
+    <div class="sheetHead">
+      <div>
+        <h3>Detection model</h3>
+        <div class="sub" id="modelDir"></div>
+      </div>
+      <button id="modelClose">Close</button>
+    </div>
+    <div class="sheetActions">
+      <button id="modelPick">Choose model file&hellip;</button>
+      <input type="file" id="modelFile" accept=".pt,.engine,.onnx" hidden>
+      <span class="tag">uploads it to the gate, then switches</span>
+      <input type="file" id="yamlFile" accept=".yaml,.yml" hidden>
+    </div>
+    <div id="modelList"></div>
+    <div id="modelNote"></div>
+    <div id="modelErr"></div>
+  </div>
+</div>
+
+<div id="recordsModal">
+  <div class="sheet wide">
+    <div class="sheetHead">
+      <div>
+        <h3>Capture records</h3>
+        <div class="sub" id="recCsvPath"></div>
+      </div>
+      <button id="recordsClose">Close</button>
+    </div>
+    <div class="sheetActions">
+      <button id="recordsRefresh">Refresh</button>
+      <input id="recSearch" placeholder="Filter by worker ID or any badge heard (RFID)&hellip;" spellcheck="false">
+    </div>
+    <div class="recWrap">
+      <table class="recTable">
+        <thead><tr id="recHead"></tr></thead>
+        <tbody id="recBody"></tbody>
+      </table>
+    </div>
+    <div id="recFoot">
+      <span id="recCount"></span>
+      <span id="recPager">
+        <button id="recFirst" title="First page">&laquo;</button>
+        <button id="recPrev">&lsaquo; Prev</button>
+        <span id="recPage"></span>
+        <button id="recNext">Next &rsaquo;</button>
+        <button id="recLast" title="Last page">&raquo;</button>
+      </span>
+    </div>
+    <div id="recErr" style="color:var(--ng);font-size:14px;margin-top:8px"></div>
+  </div>
+</div>
+
+<div id="rfidModal">
+  <div class="sheet wide">
+    <div class="sheetHead">
+      <div>
+        <h3>RFID reads</h3>
+        <div class="sub" id="rfidSub"></div>
+      </div>
+      <button id="rfidClose">Close</button>
+    </div>
+    <div class="sheetActions">
+      <button id="rfidRefresh">Refresh</button>
+      <label class="tag chk"><input type="checkbox" id="rfidAuto" checked> auto-refresh</label>
+      <span class="tag" id="rfidCount"></span>
+    </div>
+    <div class="sheetActions rfidSet" title="Stronger transmit power reaches badges further away; a more sensitive receive mode hears fainter ones. Both also pick up bystanders' badges further off — raise the one-person threshold (dBm slider) if 「兩張卡」 refusals start. Applied live and saved; the reader refuses values it does not support and keeps the old ones.">
+      <label for="rfidPower">發射功率</label>
+      <input type="number" id="rfidPower" min="5" max="33" step="0.5">
+      <span>dBm</span>
+      <label for="rfidMode">接收模式</label>
+      <select id="rfidMode"></select>
+      <button id="rfidApply">套用</button>
+      <span class="tag" id="rfidSetState"></span>
+    </div>
+    <div class="recWrap">
+      <table class="recTable">
+        <thead><tr>
+          <th>Tag ID (EPC)</th><th>Peak</th><th>Latest</th><th>Reads</th>
+          <th>First seen</th><th>Last seen</th><th>Age</th><th>At gate?</th><th>Whitelist</th>
+        </tr></thead>
+        <tbody id="rfidBody"></tbody>
+      </table>
+    </div>
+    <div id="rfidErr" style="color:var(--ng);font-size:14px;margin-top:8px"></div>
+  </div>
+</div>
+
+<div id="towerModal">
+  <div class="sheet">
+    <div class="sheetHead">
+      <div>
+        <h3>Speaker test</h3>
+        <div class="sub" id="towerSub">&hellip;</div>
+      </div>
+      <button id="towerClose">Close</button>
+    </div>
+    <div class="towerLab">Voice &mdash; the tower reads this text aloud</div>
+    <div class="sheetActions">
+      <input id="towerText" maxlength="400" value="hello" placeholder="Text to speak&hellip;" spellcheck="false">
+      <select id="towerLang" title="The sample unit is documented to speak English and Japanese only. It accepts a Chinese request, but may stay silent — the newer model speaks Chinese">
+        <option value="en">English</option><option value="jp">日本語</option><option value="cn">中文</option>
+      </select>
+      <button id="towerSpeak">&#128266; Speak</button>
+    </div>
+    <div class="towerLab">Speaker volume &mdash; saved on the tower (about 3 s), then 「檢測通過」 plays once at the new level</div>
+    <div class="sheetActions">
+      <input type="range" id="towerVol" min="0" max="15" step="1" value="8" disabled
+             aria-label="Speaker volume, 0 to 15">
+      <span class="areaNum" id="towerVolVal">&hellip;</span>
+      <label class="tag muteLabel"><input type="checkbox" id="towerMute" disabled> 靜音 (Mute)</label>
+      <span class="tag" id="towerVolState"></span>
+    </div>
+    <div class="towerLab">Lights &mdash; one lamp flashes for 5 s, then the light goes back to the gate's own state</div>
+    <div class="sheetActions">
+      <button class="lampBtn red" data-lamp="red">Red</button>
+      <button class="lampBtn amber" data-lamp="amber">Yellow</button>
+      <button class="lampBtn green" data-lamp="green">Green</button>
+      <span style="flex:1"></span>
+      <button id="towerOff" title="End the test flash and stop any voice still playing; the light goes back to showing the gate's own state">&#9632; Stop test</button>
+    </div>
+    <div id="towerMsg"></div>
+  </div>
+</div>
+
+<div id="lightbox"><img id="lightboxImg" alt="capture"></div>
+
+<div id="busy">checking&hellip;</div>
+
+<!-- 大字報 (demo) mode: web/demo.js. A layer over this page; nothing here changes. -->
+<div id="demo" role="dialog" aria-label="大字報">
+  <div class="dCtl">
+    <button id="demoFs" type="button">&#9974; 全螢幕</button>
+    <button id="demoExit" type="button">開發者模式</button>
+  </div>
+  <div class="dTop">
+    <div class="dCam" id="demoCam"><img id="demoImg" alt="camera" hidden><canvas id="demoBoxes"></canvas><span class="dNoCam" id="demoNoCam">等待攝影機畫面…</span></div>
+    <div class="dSide" id="demoItems"></div>
+  </div>
+  <div class="dBanner" id="demoBanner">待命中</div>
+</div>
+
+<script src="/app.js"></script>
+<script src="/demo.js"></script>
+</body>
+</html>

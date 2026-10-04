@@ -1,0 +1,21 @@
+# Secrets — never commit (see CLAUDE.md). The *.example files show their shape.
+config/camera.local.json
+config/tower.local.json
+*.local.json
+!*.local.json.example
+
+# Collected data: the operator's records and training images, written by the gate.
+captures.csv
+captures.csv.*
+dataset/
+events.jsonl
+events.sent
+events.rejected.jsonl
+
+# IT mock receiver's test data — contains worker photos.
+it_mock_data/
+
+# Backup copies and Python caches.
+*.bak
+__pycache__/
+*.pyc

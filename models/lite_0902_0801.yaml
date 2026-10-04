@@ -1,0 +1,10 @@
+names:
+  0: helmet
+  1: no-helmet
+  2: no-harness
+  3: person
+  4: harness
+nc: 5
+path: /home/mic-713/Desktop/ppe-gate-jetson/dataset/realtime/lite_0902_0801
+train: images/train
+val: images/val

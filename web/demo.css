@@ -1,0 +1,55 @@
+/* 大字報 (demo) mode: a full-screen layer over the developer page, for showing the gate
+   to visitors. It only READS what the developer page already has (the latest result,
+   the alarm, the live camera) — every control underneath keeps working untouched.
+   Sized in viewport units so it fills any screen it is put on full-screen. */
+/* --camH: the height the camera box gets — the screen minus the banner and the gaps. The
+   box is the camera's own shape (--ar, set from the first frame; 4:3 until then), so the
+   picture fills it edge to edge and the boxes drawn over it land where they belong. */
+#demo{position:fixed;inset:0;z-index:1000;display:none;background:#fff;color:#111;
+      font-family:"Noto Sans TC","Noto Sans CJK TC","Microsoft JhengHei","PingFang TC",sans-serif;
+      --pad:2.5vh;--banner:19vh;--camH:calc(100vh - 3 * var(--pad) - var(--banner));
+      padding:var(--pad) 2vw;box-sizing:border-box;
+      grid-template-rows:minmax(0,1fr) auto;gap:var(--pad)}
+#demo.on{display:grid}
+
+#demo .dTop{display:grid;grid-template-columns:auto minmax(0,1fr);gap:2.5vw;min-height:0;
+            align-items:center}
+#demo .dCam{position:relative;width:min(64vw,calc(var(--camH) * var(--arn,1.3333)));
+            aspect-ratio:var(--ar,4 / 3);background:#f1f1f1;border-radius:.8vh;overflow:hidden}
+#demo .dCam img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block}
+/* display:block — app.css hides every canvas until it is .ready (the result canvas). */
+#demo .dCam canvas{position:absolute;inset:0;width:100%;height:100%;max-width:none;max-height:none;
+                   pointer-events:none;display:block}
+#demo .dCam .dNoCam{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+                    color:#888;font-size:3vh}
+#demo .dCam .dNoCam[hidden]{display:none}
+
+#demo .dSide{display:flex;flex-direction:column;justify-content:center;gap:3.5vh;min-width:0}
+#demo .dItem{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,16vw);align-items:center;gap:1.5vw}
+#demo .dName{font-size:6.5vh;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#demo .dBadge{height:13vh;border-radius:1vh;display:flex;align-items:center;justify-content:center;
+              font-size:7.5vh;font-weight:800;color:#fff;background:#c8c8c8;
+              box-shadow:inset 0 0 0 2px rgba(0,0,0,.18)}
+#demo .dBadge.ok{background:#6aa84f}
+#demo .dBadge.ng{background:#e8382a}
+#demo .dTag{font-size:5.5vh;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#demo .dTag b{color:#0a2ee6;font-weight:800;font-variant-numeric:tabular-nums}
+
+#demo .dBanner{height:var(--banner);border-radius:1.2vh;display:flex;align-items:center;justify-content:center;
+               font-size:11vh;font-weight:800;color:#fff;background:#9a9a9a;letter-spacing:.06em;
+               box-shadow:inset 0 0 0 2px rgba(0,0,0,.18);white-space:nowrap;overflow:hidden}
+#demo .dBanner.ng{background:#e8382a}
+#demo .dBanner.ok{background:#4f9a3a}
+#demo .dBanner.warn{background:#e6a100}
+#demo .dBanner.busy{background:#e6a100}
+#demo .dBanner.closed{background:#5a5a5a}
+#demo .dBanner small{font-size:6vh;font-weight:600;margin-left:3vw;opacity:.95}
+
+/* The way back: small and faint in a corner, so it never competes with the result. */
+#demo .dCtl{position:absolute;top:1.2vh;right:1.2vw;display:flex;gap:8px;opacity:.25;
+            transition:opacity .2s}
+#demo .dCtl:hover,#demo .dCtl:focus-within{opacity:1}
+#demo .dCtl button{border:1px solid #bbb;background:#fff;color:#333;border-radius:6px;
+                   padding:6px 12px;font-size:14px;cursor:pointer}
+#demo .dCtl button:focus-visible{outline:2px solid #0a2ee6}
+@media (prefers-reduced-motion:reduce){ #demo .dCtl{transition:none} }

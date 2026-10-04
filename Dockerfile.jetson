@@ -1,0 +1,32 @@
+# Jetson Orin NX / JetPack 6.x (L4T r36) — ARM64 ONLY.
+#
+# The base MUST be the jetson-jetpack6 tag, not `ultralytics/ultralytics:latest`.
+# `latest` is an amd64 desktop image with a +cuXXX torch wheel and NO tensorrt module,
+# so building from it produced an image that (a) was mislabeled arm64 while containing
+# x86-64 binaries and (b) could never run scripts/export_trt.py.
+# This tag ships NVIDIA's L4T torch/torchvision plus the TensorRT python bindings.
+#
+# DO NOT `docker build` this on the x86 box — there is no arm64 base there to build on,
+# and Docker will silently stamp an x86 image as arm64. Build it ON the Jetson:
+#   (x86)    docker pull --platform linux/arm64 ultralytics/ultralytics:latest-jetson-jetpack6
+#            docker save ultralytics/ultralytics:latest-jetson-jetpack6 | gzip > base.tar.gz
+#   (jetson) gunzip -c base.tar.gz | docker load
+#            docker build -f Dockerfile.jetson -t ppe-safety:jetson .
+FROM ultralytics/ultralytics:latest-jetson-jetpack6
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-libav \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+# scripts/ only. models/ is bind-mounted at runtime (-v ./models:/app/models);
+# COPY-ing it baked the whole 2605-image training set into the image.
+COPY scripts/ ./scripts/
+
+CMD ["python3", "scripts/inference.py", "--help"]

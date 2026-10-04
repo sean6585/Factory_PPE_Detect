@@ -1,0 +1,107 @@
+Image data flow: camera -> model -> screen, and where latency actually came from.
+(2026-09-14, after the "live view lags 5s -> 20s" investigation)
+
+=====================================================================
+1. Format chain, one frame
+=====================================================================
+
+ stage                     where            format                                 size/frame
+ ------------------------  ---------------  -------------------------------------  ----------
+ sensor -> ISP -> encoder  on the Bosch     Bayer -> YUV 4:2:0 -> H.264            ~13 KB
+                                            (Main, 8-bit, 2592x1944 @30fps)        (3.2 Mbps)
+ wire                      Ethernet         RTP packets, H.264 NAL fragments,      -
+                                            INTERLEAVED in the RTSP TCP connection
+                                            (protocols=tcp; --rtsp-protocol udp
+                                            is available, measured no faster)
+ rtph264depay              Jetson CPU       RTP -> H.264 NAL units                 same bytes
+ h264parse                 Jetson CPU       framed access units; SPS parsed here   same
+                                            (this is where width/height/fps appear)
+ nvv4l2decoder             NVDEC hardware   NV12 in memory:NVMM (YUV 4:2:0, DMA    2592x1944x1.5
+                                            buffer, CPU never touches it), still     ~= 7.6 MB
+                                            full camera resolution
+ nvvidconv                 VIC hardware     NV12(NVMM) -> BGRx in system memory,   1280x960x4
+                                            SCALED to --cap-width x --cap-height     ~= 4.9 MB
+                                            (colour convert + resize + GPU->CPU
+                                            copy in one hardware pass)
+ videoconvert              Jetson CPU       BGRx -> BGR (drops the pad byte;       1280x960x3
+                                            VIC cannot emit 3-byte BGR, OpenCV       ~= 3.7 MB
+                                            wants it)
+ appsink / cv2.read()      CPU              numpy uint8 (960,1280,3) BGR           3.7 MB
+                                            = _camera["frame"]  (latest-wins)
+ ultralytics preprocess    CPU -> GPU       BGR->RGB, letterbox to imgsz 640,       640x640x3x2
+                                            /255 -> float16 CHW (engine is --half)   ~= 2.5 MB
+ TensorRT engine           GPU              (1, 4+nc, 8400) -> NMS -> boxes         -
+                                            scaled back to 1280x960 coords
+
+ The MODEL SEES RAW BGR. JPEG never enters the live inference path.
+
+ Where JPEG IS used (cv2.imencode, libjpeg, CPU):
+   88  CAPTURE_JPEG_QUALITY      saved training data + the result picture shown
+                                 after a check ("the dataset gets the good pixels")
+   80  --stream-quality          live view (/api/live_frame and /api/stream)
+   70  REALTIME_PREVIEW_QUALITY  realtime mode's preview
+ Upload paths (Choose image(s), Play folder) DO decode JPEG -> BGR before inference,
+ so the model trains on q88 frames and runs live on uncompressed ones. Small gap,
+ in the model's favour.
+
+ The model's effective resolution is --imgsz (640), NOT the capture size: a 1280x960
+ frame letterboxed into 640x640 is ~640x480 of content, so a 40 px helmet becomes
+ ~20 px. Small far objects lose most detail here. The .engine input size is FIXED at
+ export (export_trt.py --imgsz); changing it means re-exporting (~11 min) and
+ inference cost grows ~ imgsz^2.
+
+ CPU work in the whole chain: depay/parse (tiny), videoconvert, then whatever
+ consumes the BGR array: inference preprocessing and JPEG encoding. Decode, scale,
+ colour conversion are all hardware.
+
+=====================================================================
+2. The latency problem and the fix
+=====================================================================
+
+ Symptom: kiosk live view 5 s behind, growing to 20 s+ over a session.
+
+ Ruled OUT by measurement (all on the Jetson):
+   - camera thread freshness  _camera["ts"] age 0.00-0.03 s, continuously
+   - server write loop        curl on localhost got ~11 fps from /api/stream, no stalls
+   - network/kernel buffers   ss -tn Send-Q = 0 on every connection, 5 checks
+   - TCP vs UDP RTP           ~24 ms average both; TCP one 215 ms stall vs UDP max 53 ms
+   - 5 MP capture             JPEG encode 58 ms vs 13 ms per frame (4.4x), x5 per
+                              burst = real cost but tens of ms, not seconds
+
+ Cause: the DELIVERY MECHANISM to the browser.
+
+ BEFORE  (server push, MJPEG)
+   _mjpeg() reads latest frame, JPEG-encodes, WRITES to the socket every 67 ms,
+   forever, regardless of whether the browser finished the previous frame.
+   Browser <img src="/api/stream"> (multipart/x-mixed-replace) must decode+paint
+   every part IN ORDER and has no way to skip ahead. Firefox runs ON the Jetson,
+   sharing the CPU with gate_server.py (~107%: decode+inference+serving). The moment
+   its paint fell behind the push rate, frames queued inside the browser and every
+   painted frame was older than the last -> lag GROWS, never recovers.
+
+ AFTER  (browser pull, poll)
+   GET /api/live_frame returns ONE fresh JPEG (~23 ms). web/app.js liveTick() asks
+   every 250 ms, one request in flight at a time (LIVE_BUSY). Each tick shows
+   whatever the camera buffer holds AT THAT MOMENT - the same latest_frame() a
+   CAPTURE & CHECK reads. A slow browser shows FEWER frames, never staler ones. No
+   queue exists to grow. Every other live value on the page (camera status, DI,
+   realtime mode) already worked this way; video was the last push holdout.
+
+ /api/stream and _mjpeg() are kept for external viewers (VLC/ffplay) - those drop
+ frames properly, so the queuing problem does not apply to them.
+
+ Side effects fixed for free: the "Resume live view" bug (img.src="" reads back as
+ the page URL, so "already connected" was always true) vanished with the persistent
+ connection. "Pause live view" button stops the polling entirely.
+
+=====================================================================
+3. Still open (as of 2026-09-14)
+=====================================================================
+
+ "Finger in front of camera, CAPTURE & CHECK shows no finger" was reported while the
+ live view was 20 s stale. That check path never touched the push stream and its
+ buffer is proven fresh, so it is NOT explained by the above. Re-test now that the
+ live view is real-time: if the finger shows live but not in the check result, look
+ at the camera's H.264 GOP settings (Bosch "Auto" keyframe interval can be up to 255
+ frames ~ 8.5 s; IBP/IBBP GOPs add decode-reorder delay). A raw-NAL I/P/B parse was
+ started and not finished.

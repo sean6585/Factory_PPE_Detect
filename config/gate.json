@@ -1,0 +1,55 @@
+{
+  "items": [
+    {
+      "label": "Hardhat",
+      "classes": [
+        "helmet"
+      ],
+      "negatives": [
+        "no-helmet"
+      ],
+      "conf": 0.7
+    },
+    {
+      "label": "Safety Harness",
+      "classes": [
+        "harness"
+      ],
+      "negatives": [
+        "no-harness"
+      ],
+      "conf": 0.7
+    },
+    {
+      "label": "Bodycam",
+      "classes": [
+        "Mask"
+      ],
+      "negatives": [
+        "NO-Mask"
+      ],
+      "conf": 0.75,
+      "enabled": false
+    }
+  ],
+  "person_class": "person",
+  "person_conf": 0.7,
+  "frames": 5,
+  "votes_required": 2,
+  "containment": 0.5,
+  "negative_veto": true,
+  "trigger_min_area": 190000,
+  "rfid_min_rssi": -70.0,
+  "trigger_zone": [
+    0.284,
+    0.722
+  ],
+  "model": "yolo11n_PPE_0920.engine",
+  "direction_source": "track",
+  "rfid_power_dbm": 24.0,
+  "rfid_rf_mode": 345,
+  "door_side": "left",
+  "track_person_conf": 0.6,
+  "exit_area_fraction": 0.9,
+  "away_fraction": 0.7
+}
