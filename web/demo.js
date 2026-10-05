@@ -15,8 +15,14 @@
   const WARN = new Set(["crowd", "multi"]);       // yellow on the tower too: a warning
   const QUIET = new Set(["no_worker"]);           // nothing was said; not an alarm
   const STORE_KEY = "ppeDemoMode";
+  // The IT upload row (and its polling): off — the operator follows IT on the developer
+  // page's IT tag instead (2026-10-05). true brings the row back as it was.
+  const SHOW_IT = false;
 
   let result = null;          // the check the developer panel is holding (null = standby)
+  let itCheck = null;         // that check's IT post: {state: pending/sent/failed/rejected, …}
+  let itStat = null;          // /api/it_status — the reporter as a whole
+  let itTimer = null;
   let alarm = {key: null, s: null};
   let liveBusy = false, liveTimer = null;
   window.DEMO_ON = false;
@@ -43,6 +49,12 @@
     tag.append("Tag ID : ");
     const b = document.createElement("b"); b.id = "demoTag"; b.textContent = "—";
     tag.append(b); box.append(tag);
+    if (SHOW_IT){
+      const it = document.createElement("div"); it.className = "dIt";
+      it.append("IT 上傳 : ");
+      const ib = document.createElement("b"); ib.id = "demoIt"; ib.textContent = "—";
+      it.append(ib); box.append(it);
+    }
     rendered = JSON.stringify(labels);
   }
 
@@ -57,6 +69,57 @@
       b.textContent = r ? (r.ok ? "OK" : "NG") : "—";
     });
     D("demoTag").textContent = tagText();
+    paintIT();
+  }
+
+  // ── IT upload row ───────────────────────────────────────────────────────────
+  // A check from the image trigger is posted to IT at its verdict (gate_server
+  // _post_check_now); its outcome lands on the check itself (it_state), which /api/last
+  // serves live. Anything else — a violation, a refusal, standby — goes out through the
+  // outbox when the visit ends, so the row then shows the reporter's latest state.
+  const AT = {entry: "進場", leave: "出場"};
+  function utcToLocal(t){
+    const d = new Date(String(t).replace(" ", "T") + "Z");
+    return isNaN(d) ? "" : d.toLocaleTimeString("zh-TW", {hour12: false});
+  }
+  function shortErr(e){
+    const m = /HTTP \d+/.exec(e || "");
+    return m ? m[0] : "連線失敗";
+  }
+  function itText(){
+    const live = alarm.s ? alarm.s.it_live : (itStat && itStat.enabled);
+    if (!live) return ["未開啟", ""];
+    const st = itCheck && itCheck.state;
+    if (st === "pending") return ["上傳中…", "busy"];
+    if (st === "sent") return ["成功" + (AT[itCheck.access_type] ? " · " + AT[itCheck.access_type] : ""), "ok"];
+    if (st === "failed") return [`失敗 ${shortErr(itCheck.error)} · 稍後自動重送`, "ng"];
+    if (st === "rejected") return [`被拒收 ${shortErr(itCheck.error)}`, "ng"];
+    const s = itStat || {};
+    if (s.hb_ok === false) return ["心跳失敗 · 連不到 IT", "ng"];
+    if (s.last_error && s.pending_bytes > 0) return [`待重送 ${shortErr(s.last_error)}`, "ng"];
+    if (s.last_ok) return ["最近成功 " + utcToLocal(s.last_ok), "ok"];
+    return ["已開啟 · 尚無上傳", ""];
+  }
+  function paintIT(){
+    const el = D("demoIt");
+    if (!el) return;
+    const [text, cls] = itText();
+    el.textContent = text;
+    el.className = cls;
+  }
+  async function itTick(){
+    if (!window.DEMO_ON){ itTimer = null; return; }
+    try{
+      itStat = await (await fetch("/api/it_status")).json();
+      // The held check's post, while it is still on screen: its state changes in place
+      // on the server (pending → sent / failed) as IT answers.
+      if (result && result.frame_id){
+        const d = await (await fetch("/api/last")).json();
+        if (d && d.frame_id === result.frame_id) itCheck = d.it_state || null;
+      }
+    }catch(e){}
+    paintIT();
+    itTimer = setTimeout(itTick, result ? 500 : 2000);
   }
 
   // The badge of the check on screen; failing that, the badge(s) the alarm is about
@@ -70,19 +133,27 @@
 
   function paintBanner(){
     const el = D("demoBanner"), s = alarm.s || {};
-    // No announcement running but a check held on screen (e.g. Check Now, which raises
-    // no trigger alarm): the banner states its verdict, as the badges above it do.
-    const key = alarm.key || (result ? {PASS: "pass", FAIL: "fail"}[result.status] || null : null);
+    // No announcement running but a check held on screen: the banner states its verdict,
+    // as the badges above it do — ONLY for a check the trigger did not raise (Check Now).
+    // An image-trigger check has its own announcement; falling back to its verdict after
+    // a later refusal's announcement ended made the banner jump back (2026-10-05).
+    const manual = result && result.source !== "image";
+    const key = alarm.key || (manual ? {PASS: "pass", FAIL: "fail"}[result.status] || null : null);
     const t = key && typeof ALARM_TEXT !== "undefined" && ALARM_TEXT ? ALARM_TEXT[key] : null;
     let cls = "", main = "待命中", sub = "";
     if (t && !QUIET.has(key)){
-      // 「檢測通過」 plus 請進場 / 請出場 when IT (or the track) said which way.
+      // 「檢測通過」, plus 請進場 / 請出場 only when the voice says them too — in 軌跡方向
+      // mode (gate_server PASS_VOICE_SAYS_DIRECTION; the status says which).
       main = t[0];
-      if ((key === "pass_entry" || key === "pass_leave") && t[1]) sub = t[1];
+      if (s.pass_says_direction && (key === "pass_entry" || key === "pass_leave") && t[1]) sub = t[1];
       cls = key.startsWith("pass") ? "ok" : WARN.has(key) ? "warn" : "ng";
     } else if (s.light && s.light.light === "red"){
       main = "暫停開放"; sub = s.light.reason || ""; cls = "closed";
-    } else if (s.enabled && s.watching && s.dwell > 0){
+    } else if (alarm.pending || (s.enabled && s.watching && (s.checking || s.dwell > 0))){
+      // The whole check — the dwell, the burst after it, and the moment between the
+      // burst ending and its result reaching this page (pending: the trigger already
+      // announced a check whose result is not in yet) — or the banner dropped to 待命中
+      // in those gaps (measured 2026-10-06: ~1 s during the burst, ~0.3 s after it).
       main = "檢測中…"; cls = "busy";
     }
     el.className = "dBanner" + (cls ? " " + cls : "");
@@ -93,10 +164,11 @@
   // ── hooks the developer page calls ──────────────────────────────────────────
   window.demoResult = res => {
     result = res || null;
+    itCheck = (res && res.it_state) || null;
     if (window.DEMO_ON){ paintItems(); paintBanner(); }
   };
-  window.demoAlarm = (key, s) => {
-    alarm = {key: key || null, s: s || null};
+  window.demoAlarm = (key, s, pending) => {
+    alarm = {key: key || null, s: s || null, pending: !!pending};
     if (window.DEMO_ON){ paintBanner(); paintItems(); paintBoxes(); }
   };
 
@@ -187,6 +259,7 @@
     D("demo").classList.add("on");
     paintItems(); paintBanner();
     if (!liveTimer) liveTick();
+    if (SHOW_IT && !itTimer) itTick();
     if (fullscreen && document.documentElement.requestFullscreen){
       document.documentElement.requestFullscreen().catch(() => {}).finally(paintFsButton);
     }
@@ -197,6 +270,7 @@
     remember(false);
     D("demo").classList.remove("on");
     clearTimeout(liveTimer); liveTimer = null; liveBusy = false;
+    clearTimeout(itTimer); itTimer = null;
     if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {});
   }
 

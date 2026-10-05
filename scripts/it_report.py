@@ -17,19 +17,22 @@ tool's format, NOT the gate's local clock (captures.csv / events.jsonl are local
 What becomes a ppe-result POST:
   * every PASS / FAIL check in a visit, oldest first — a FAIL later fixed still reaches IT
     — except a PASS whose worker then turned back or stood on (did not go through);
-  * a worker who went INTO the plant without a PASS (未檢查即進入, 被拒絕仍進入,
-    未通過仍進入). The form has no violation field, so it goes as ppeResult=Fail with the
-    item fields empty and the photo of the moment they walked in — the operator's call.
-    After a FAIL that makes two posts: the check (its items, its photo) and the intrusion.
+  * a worker who went through without a PASS, IN or OUT (未檢查即進入, 被拒絕仍進入,
+    未通過仍進入, and since 2026-10-06 未檢查即出場, 被拒絕仍出場, 未通過仍出場). The form
+    has no violation field, so it goes as ppeResult=Fail with the item fields empty and
+    the photo of the moment they went through — the operator's call. After a FAIL that
+    makes two posts: the check (its items, its photo) and the violation.
   * a badge that is not on the whitelist (「ID未登入」), once per badge per visit, as
     ppeResult=Fail with the item fields empty, that badge's ID, and the refusal's photo.
     If the same worker then walks in anyway, that is 被拒絕仍進入 and sent as well.
-Exits without a check are not sent (only entering was asked for); they stay in
-events.jsonl and See Records.
 
-Results are not sent at the verdict. They are read from events.jsonl, where a visit is
-written only once it has resolved — the worker went through, turned back, or stood — so
-nothing leaves the gate before it is known what actually happened.
+When: an image-trigger PASS / FAIL is posted AT THE VERDICT (gate_server._post_check_now
+→ ITReporter.post_check), because IT's reply (access_type) decides in/out (operator,
+2026-10-01). Everything else — the intrusion form, ID未登入, and any verdict post that
+failed — is read from events.jsonl, where a visit is written only once it has resolved
+(went through, turned back, stood 30 s, or its ID vanished 3.5 s); the outbox polls it
+every DRAIN_POLL_S. A check already posted at the verdict is marked in its visit entry
+and never sent twice (_already_sent).
 
 Durable, at-least-once: the sender records how far into events.jsonl it has got
 (events.sent, a byte offset) and only moves past a line once the server has accepted
@@ -183,10 +186,10 @@ def result_forms(ev: dict, cfg: dict) -> list[tuple[dict, str, str]]:
             continue
         fields = check_fields(c, cfg)
         forms.append((fields, c.get("image", ""), fields["ppeResult"]))
-    if entered_without_pass(ev):
+    if through_without_pass(ev):
         fields = {
             "time": local_to_utc(ev["ts"]),
-            # The strongest badge in range when they walked in, if the reader heard one.
+            # The strongest badge in range when they went through, if the reader heard one.
             "rfid": (ev.get("epc") or "").split(" ")[0],
             "ppeResult": "Fail",
         }
@@ -197,13 +200,16 @@ def result_forms(ev: dict, cfg: dict) -> list[tuple[dict, str, str]]:
     return forms
 
 
-def entered_without_pass(ev: dict) -> bool:
-    """Went INTO the plant without a PASS: no check at all, refused, or after a FAIL.
+def through_without_pass(ev: dict) -> bool:
+    """Went through the gate — in OR out — without a PASS: no check at all, refused, or
+    after a FAIL. Exits were left out until 2026-10-06, when the operator asked for them
+    too (未檢查即出場 / 未通過仍出場 / 被拒絕仍出場).
 
     After a FAIL this is a SECOND post next to the failed check's own (operator,
     2026-09-30): the check says what was missing, at the moment of the check; this one
-    says they walked in anyway, with the frame of them crossing into the restricted side."""
-    return bool(ev.get("violation")) and ev.get("departure") == "in"
+    says they went through anyway, with the frame of that moment. The form has no in/out
+    or violation field, so IT sees both directions alike (Fail, items empty)."""
+    return bool(ev.get("violation")) and ev.get("departure") in ("in", "out")
 
 
 class ITReporter:

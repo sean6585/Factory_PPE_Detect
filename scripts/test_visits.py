@@ -240,6 +240,38 @@ check("walk-away line 0.65: exit, then an intrusion", outcome(events()),
 check("both spoken", said, ["exit_unchecked", "intrusion"])
 gs._state["cfg"].pop("away_fraction")
 
+print("19. PASS, then the same ID goes through: the 5 s window ends at once, next round opens")
+import time as _time
+def _pass(self):
+    """This walker's visit just PASSed: the PASS window and its cooldown are open."""
+    gs._visits[self.tid]["checks"] = [{"status": "PASS", "epc": "E1", "items": {}}]
+    gs._image_trigger["pass_tid"] = self.tid
+    gs._image_trigger["next_allowed"] = _time.monotonic() + 5.0
+    gs._light_policy.flash("green_flash", 5.0, _time.monotonic(), "pass")
+    return self
+Walk._pass = _pass
+for label, tid, walk in (
+        ("in (to the door edge)", 30,
+         lambda w: w.at(0.5, 400000, 5)._pass().at(0.6, 400000).at(0.7, 400000)),
+        ("out (walks away)", 31,
+         lambda w: w.at(0.85, 400000, 3).at(0.5, 400000, 3)._pass().shrink(0.5, 400000))):
+    reset()
+    walk(Walk(tid))
+    check(f"{label}: no alarm", (outcome(events())[0][3], said), (None, []))
+    check(f"{label}: cooldown over now", gs._image_trigger["next_allowed"] <= _time.monotonic(), True)
+    check(f"{label}: green flash ended",
+          gs._light_policy.desired(_time.monotonic(), None, False) != "green_flash", True)
+
+print("20. PASS voice: 軌跡方向 adds 請進場/請出場 (2026-10-06), IT 回報 says just 「檢測通過」")
+want = {("track", "in"): "pass_entry", ("track", "out"): "pass_leave",
+        ("it", "in"): "pass", ("it", "out"): "pass"}
+for (mode, intent), key in want.items():
+    reset()
+    gs._state["cfg"]["direction_source"] = mode
+    gs.announce({"status": "PASS", "source": "image", "intent": intent, "items": []})
+    check(f"{mode} mode, {intent}: says", said, [key])
+gs._state["cfg"].pop("direction_source")
+
 if fails:
     print("\n" + "\n".join(fails))
     sys.exit(1)

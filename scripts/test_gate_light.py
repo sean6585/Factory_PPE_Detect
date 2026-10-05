@@ -70,7 +70,16 @@ check("check photo, then crossing photo", [f[1] for f in forms], ["f.jpg", "alar
 check("the check keeps its items", (forms[0][0]["helmet"], forms[0][0]["harness"]), ("Fail", "Pass"))
 check("the intrusion's items are empty", (forms[1][0]["helmet"], forms[1][0]["harness"]), ("", ""))
 ev_out = dict(ev, violation="未通過仍出場", departure="out")
-check("walking OUT after a FAIL: only the check", [f[2] for f in result_forms(ev_out, cfg)], ["Fail"])
+check("walking OUT after a FAIL: the check AND the violation (since 2026-10-06)",
+      [f[2] for f in result_forms(ev_out, cfg)], ["Fail", "未通過仍出場"])
+ev_unchecked = {"ts": "2026-09-30 21:01:00", "violation": "未檢查即出場", "departure": "out",
+                "image": "alarms/out.jpg", "epc": "E", "checks": []}
+forms = result_forms(ev_unchecked, cfg)
+check("walking OUT unchecked: one Fail form", [f[2] for f in forms], ["未檢查即出場"])
+check("...items empty, the moment's photo", (forms[0][0]["ppeResult"], forms[0][0]["helmet"], forms[0][1]),
+      ("Fail", "", "alarms/out.jpg"))
+check("turning back is never a violation form",
+      [f[2] for f in result_forms(dict(ev_unchecked, violation=None, departure="back"), cfg)], [])
 
 if fails:
     print("\n" + "\n".join(fails))

@@ -264,9 +264,15 @@ empties See Records. Add columns; don't reorder or rename them.
     - Known weak spot: an ID switch in the band (a big jump, or a detection dropout while
       walking) makes the new ID look like it appeared from nowhere, so an exiting worker
       can be read as entering. Seen in testing only with an unrealistic 245 px jump.
-    - Every box above `cfg.trigger_min_area` counts as a person at the gate — **not
-      just the largest**. Two of them refuses immediately (`multi-person-detected.mp3`),
-      before any dwell, so a pair is told to queue rather than checked as one.
+    - Every box above `cfg.trigger_min_area` **whose centre is inside the door zone
+      (ROI)** counts as a person at the gate — not just the largest. Two of them refuses
+      (「檢測口請淨空」, after `CROWD_CONFIRM_S`), before any dwell, so a pair is told to
+      queue rather than checked as one. People outside the ROI are ignored by the crowd
+      rule (operator, 2026-10-05: of that day's 100 crowd refusals on site only 4 had two
+      people in the zone). The dwell subject is the largest person IN the zone, and an
+      image-trigger check passes the zone to `ppe_check.evaluate` (`subject_zone_px`) so
+      the checklist judges that same person — never a bigger bystander beside the gate;
+      nobody in the zone = NO_WORKER.
     - Exactly one, with its box centre inside the `cfg.trigger_zone` band, starts
       `t_enter`. The timer **survives brief dropouts**: only `IMAGE_TRIGGER_MISS_S` (1 s)
       of unbroken absence ends the visit. Never reset the timer on a single miss — the
@@ -308,7 +314,7 @@ empties See Records. Add columns; don't reorder or rename them.
       open/idle, yellow steady = checking (dwell or burst), green flash = PASS window,
       yellow flash = warning (crowd, two badges, passed but did not go), red flash =
       fail (no tag, unregistered, PPE FAIL, walked in), red steady = closed (camera
-      dead, reader down or deaf, trigger off, model swapping). The gate re-sends it
+      dead, reader disconnected, trigger off, model swapping). The gate re-sends it
       every second with the tower's restore timer as a dead-man switch: the base is
       red steady, so a dead gate / Jetson / cable turns the tower red within ~5 s
       (measured). Never drive the tower with raw commands while the gate runs — they
@@ -317,9 +323,10 @@ empties See Records. Add columns; don't reorder or rename them.
       evening of 2026-09-30); NO_WORKER is silent; FAIL
       「檢測未通過」; crowd and two badges 「檢測口請淨空」; no tag 「ID讀取失敗」;
       unregistered 「ID未登入」; reader down is silent (the light is red steady).
-      `RFID_DEAF_AFTER` (3) DIFFERENT people (track IDs) in a row with no tag heard at
-      all, and no read since = reader deaf = red steady. One badge-less worker standing
-      through many cycles counts once.
+      There is NO "reader deaf" rule (closed after N badge-less people in a row) — removed
+      at the operator's request on 2026-10-05: nobody may carry a badge on site, and the
+      gate keeps checking and saying 「ID讀取失敗」 instead of closing. So a connected
+      reader that hears nothing is NOT shown as a fault.
       The tower answers HTTP 200 even on failure; `Error. [002]` to every command
       means the unit was reset (needs its first-access account + Enable Feature →
       HTTP Command Control, and the voices re-registered).
@@ -338,12 +345,17 @@ empties See Records. Add columns; don't reorder or rename them.
       their frame in `dataset/alarms/images/` — evidence, never training data.
     - **In/out source is a kiosk switch** (`gate.json` `direction_source`, UI 「進出場判斷」):
       `it` (default) — IT's access_type decides, as below; `track` — our bbox track
-      decides (the original behaviour), the PASS voice says 請進場/請出場 from the track at
-      once, and IT's answer is only logged. IT posting is identical in both modes.
+      decides (the original behaviour) and IT's answer is only logged. IT posting is
+      identical in both modes. **The PASS voice depends on the mode**
+      (`PASS_VOICE_SAYS_DIRECTION = {"track": True, "it": False}`): 軌跡方向 says
+      「檢測通過請進場」 / 「檢測通過請出場」 (tower channels 9 / 10, back on 2026-10-06);
+      IT 回報 says just 「檢測通過」 at once (2026-10-05). The 大字報 adds 請進場 / 請出場
+      under the banner exactly when the voice does (status `pass_says_direction`).
     - **IT decides in/out** (in `it` mode; operator, 2026-10-01): an image-trigger PASS/FAIL is posted
-      to IT AT THE VERDICT (`_post_check_now`, photo from memory); the PASS voice waits up
-      to `IT_VOICE_WAIT_S` (1.5 s) for the reply's `access_type` — entry 「檢測通過請進場」,
-      leave 「檢測通過請出場」, no reply 「檢測通過」. That answer becomes the visit's
+      to IT AT THE VERDICT (`_post_check_now`, photo from memory). With
+      `PASS_VOICE_SAYS_DIRECTION["it"]` on, the PASS voice waits up to `IT_VOICE_WAIT_S` (1.5 s)
+      for the reply's `access_type` — entry 「檢測通過請進場」, leave 「檢測通過請出場」, no
+      reply 「檢測通過」; it is OFF, so 「檢測通過」 plays at once. That answer becomes the visit's
       direction (`intent_it`, over the track's guess), and went-through / violations are
       judged against it — but violations themselves (擅自闖入 / 闖出) are still ours. A
       check posted at the verdict is marked in its visit entry (`it.state`) so the outbox
@@ -356,8 +368,11 @@ empties See Records. Add columns; don't reorder or rename them.
       the visit resolves. Times are UTC. Durable and at-least-once via `events.sent`.
       Walking IN with no PPE check at all (未檢查即進入 / 被拒絕仍進入) is sent as
       `ppeResult=Fail` with the item fields empty and the photo of the moment — the
-      form has no violation field; operator's call. Exits without a check are not
-      sent. There is no in/out field yet (operator: ignore for now).
+      form has no violation field; operator's call. **Exits without a PASS are sent the
+      same way since 2026-10-06** (未檢查即出場 / 未通過仍出場 / 被拒絕仍出場 — before that
+      only entries were; `it_report.through_without_pass`), so after a FAIL an exit is two
+      posts too. There is no in/out field yet (operator: ignore for now), so IT cannot
+      tell an exit violation from an entry one.
       The kiosk's **IT Report** button switches it on/off and persists to
       `config/it.json`; switching ON reports from that moment (no replay of what
       happened while off), whereas a service restart with it ON delivers what waits.

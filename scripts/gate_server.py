@@ -293,11 +293,13 @@ def announce(res: dict):
         if res.get("source") == "image" and direction_source() == "track":
             # Our track already knows the direction — no need to wait for IT's reply.
             at = {"in": "entry", "out": "leave"}.get(res.get("intent"))
-            say({"entry": "pass_entry", "leave": "pass_leave"}.get(at, "pass"))
+            say(_pass_voice(at, "track"))
             if at:
                 _show_pass_direction(at)
             return
-        if not to_it:
+        if not to_it or not pass_voice_says_direction("it"):
+            # Nothing to wait for: no IT answer is coming, or the words no longer depend
+            # on it (the post above still runs and still sets the visit's direction).
             say("pass")
             return
 
@@ -306,7 +308,7 @@ def announce(res: dict):
             # words — a PASS is never left unannounced for want of a reply.
             done.wait(IT_VOICE_WAIT_S)
             at = state.get("access_type") if state.get("state") == "sent" else None
-            say({"entry": "pass_entry", "leave": "pass_leave"}.get(at, "pass"))
+            say(_pass_voice(at, "it"))
         threading.Thread(target=speak, daemon=True, name="pass-voice").start()
     elif status == "FAIL":
         say("fail")
@@ -1769,7 +1771,11 @@ ALARM_TEXT = {
     "fail_entered": ("擅自闖入",        "檢測未通過仍進入"),
     "out_unchecked": ("未檢查即出場",   "出場前也要先檢測"),
     "out_fail":    ("未通過仍出場",     "檢測未通過就離開"),
-    "out_refused": ("被拒絕仍出場",     "被拒絕後直接離開"),
+    # The headline is what the speaker SAYS: there is no 「被拒絕仍出場」 clip, so a refused
+    # worker walking out hears 「未檢查即出場」 (no PPE check was done) — the screen said
+    # 被拒絕仍出場 over that voice (operator, 2026-10-06). The detail stays underneath, and
+    # See Records / IT still carry the exact VIOLATION_TEXT 被拒絕仍出場.
+    "out_refused": ("未檢查即出場",     "被拒絕後直接離開"),
     "no_worker":   ("未偵測到人員",     "請站到閘門前"),
     "unregistered": ("ID未登入",        "識別證不在白名單內"),
     # 「檢測通過」 — no 「請進入」: whether this worker is going in or out is not known
@@ -1798,8 +1804,6 @@ _image_trigger = {
     "subject_intent": None,  # "in" / "out" once the subject's visit has started
     "pass_tid": None,        # track ID whose PASS window is open (green flashing)
     "pass_until": 0.0,       # ...and when it runs out if they have not crossed
-    "deaf_tids": set(),      # different people (track IDs) in a row the reader heard nothing for
-    "deaf_reads": None,      # reader's total_reads when that run started
 }
 
 
@@ -1832,6 +1836,9 @@ def _image_trigger_status() -> dict:
             "watching": it["watching"],
             "dwell_s": _state["image_dwell"],
             "dwell": round(dwell, 1),
+            # Being timed, or a burst running (the light's yellow steady) — the kiosks
+            # show 「檢測中」 for the whole of it, not only while the dwell counts.
+            "checking": gate_checking(),
             "cooldown": round(cooldown, 1),
             "person_area": it["person_area"],
             "person_cx": it["person_cx"],
@@ -1853,6 +1860,8 @@ def _image_trigger_status() -> dict:
             "alarm_text": ALARM_TEXT,
             "light": _light.state() if _light else None,
             "direction_source": direction_source(),
+            # The 大字報 adds 請進場 / 請出場 under 「檢測通過」 only when the voice says it.
+            "pass_says_direction": pass_voice_says_direction(),
             "door_side": door_side(),
             "it_live": _it is not None and _it.running,
             # [age_seconds, cx, cy, area] oldest first. Aged out here rather than on
@@ -1924,12 +1933,30 @@ VOICE = {
     "unregistered": (5, "ID_not_registered.mp3"),  # ID未登入
 }
 FLASH_HOLD_S = 5.0          # a red / yellow flash, unless a newer event replaces it
-RFID_DEAF_AFTER = 3         # different people in a row with NOTHING heard → reader counts as down
 _light_policy = LightPolicy()
 _light = None               # LightDriver when a tower is configured
 
 
 IT_VOICE_WAIT_S = 1.5       # how long a PASS voice waits for IT's access_type
+# Does the PASS voice add the direction — 「檢測通過請進場」 / 「檢測通過請出場」 (tower
+# channels 9 / 10) — or say just 「檢測通過」 (channel 6)? Per 進出場判斷 mode:
+#   track (軌跡方向): yes — the track knows the way at once (operator asked for it
+#                    back, 2026-10-06);
+#   it    (IT 回報):  no — plain 「檢測通過」 at once, no waiting on IT's reply (2026-10-05).
+# Either way the direction is still worked out and still judges went-through /
+# violations; this only decides the spoken words (and the 大字報 shows the same).
+PASS_VOICE_SAYS_DIRECTION = {"track": True, "it": False}
+
+
+def pass_voice_says_direction(mode: str | None = None) -> bool:
+    return bool(PASS_VOICE_SAYS_DIRECTION.get(mode or direction_source(), False))
+
+
+def _pass_voice(at, mode: str | None = None) -> str:
+    """The VOICE key for a PASS whose direction is `at` ("entry" / "leave" / None)."""
+    if not pass_voice_says_direction(mode):
+        return "pass"
+    return {"entry": "pass_entry", "leave": "pass_leave"}.get(at, "pass")
 
 
 def _post_check_now(res: dict):
@@ -2021,15 +2048,6 @@ def signal(name: str, hold_s: float = FLASH_HOLD_S, tag: str = "") -> None:
     _light.wake()
 
 
-def _rfid_deaf() -> bool:
-    """Connected, but RFID_DEAF_AFTER different people in a row got nothing heard at all,
-    and not a single read has arrived since — an antenna off its connector looks exactly
-    like this (seen 2026-09-30). Clears on the next read of any tag."""
-    it = _image_trigger
-    return (_rfid is not None and len(it["deaf_tids"]) >= RFID_DEAF_AFTER
-            and _rfid.obs.total_reads == it["deaf_reads"])
-
-
 def gate_abnormal() -> str | None:
     """Why the channel is closed (red steady), or None. Also true while the gate is still
     starting up — no frame yet means nobody is being watched."""
@@ -2037,8 +2055,11 @@ def gate_abnormal() -> str | None:
         return "攝影機斷線"
     if _rfid is not None and not _rfid.connected:
         return "RFID 讀取器離線"
-    if _rfid_deaf():
-        return "RFID 讀不到任何卡"
+    # No "reader deaf" rule (closed after N badge-less people in a row) any more: removed
+    # at the operator's request, 2026-10-05 — on site nobody may be carrying a badge at
+    # all, and the gate must keep checking (and saying 「ID讀取失敗」) rather than close.
+    # A reader that is connected but hears nothing (antenna off) is therefore not shown
+    # as a fault; every worker just gets ID讀取失敗.
     if _state.get("swapping"):
         return "切換模型中"
     if not _state.get("image_trigger_enabled"):
@@ -2547,12 +2568,22 @@ def image_trigger_loop() -> None:
             print(f"[image] tracker update failed: {type(e).__name__}: {e}", flush=True)
             for d in persons:
                 d["tid"] = None
+        # Big enough to be AT the gate — and, to count, standing in the door zone (ROI).
+        # Only people_in feed the crowd rule and the dwell (operator, 2026-10-05): on site
+        # people stand beside the gate and someone sits right under the camera, and of
+        # that day's 100 「檢測口請淨空」 refusals only 4 had two people inside the zone.
+        # The subject is the largest person IN the zone; with nobody there, the largest
+        # anywhere, only so the status line can say "outside door zone".
         people = [d for d in persons if d["firm"] and _area(d["box"]) >= min_area]
-        subject = max(people, key=lambda d: _area(d["box"])) if people else None
+        W = f.shape[1]
+        people_in = [d for d in people
+                     if zone[0] <= (d["box"][0] + d["box"][2]) / 2 / W <= zone[1]]
+        subject = (max(people_in, key=lambda d: _area(d["box"])) if people_in
+                   else max(people, key=lambda d: _area(d["box"])) if people else None)
         area = int(_area(subject["box"])) if subject else 0
-        cx = (round((subject["box"][0] + subject["box"][2]) / 2 / f.shape[1], 3)
+        cx = (round((subject["box"][0] + subject["box"][2]) / 2 / W, 3)
               if subject else None)
-        in_zone = cx is not None and zone[0] <= cx <= zone[1]
+        in_zone = subject is not None and subject in people_in
         now = time.monotonic()
         # Before the dwell logic, and on every tick including the cooldown: a second
         # person slipping through while the gate is still cooling down after a pass is
@@ -2568,7 +2599,7 @@ def image_trigger_loop() -> None:
             it["person_area"] = area
             it["person_cx"] = cx
             it["in_zone"] = in_zone
-            it["people"] = len(people)
+            it["people"] = len(people_in)
             it["subject_intent"] = subject.get("intent") if subject else None
             # Every person box the tick saw, normalised, for the live overlay. Boxes
             # BELOW the area threshold are included too, flagged 0: seeing what nearly
@@ -2579,9 +2610,10 @@ def image_trigger_loop() -> None:
                 [round(d["box"][0] / w, 4), round(d["box"][1] / h, 4),
                  round(d["box"][2] / w, 4), round(d["box"][3] / h, 4),
                  round(d["score"], 2), int(_area(d["box"])),
-                 # 3 = under AREA_TH but in a visit (a side-on worker out of the door)
-                 2 if d is subject else (1 if d["firm"] and _area(d["box"]) >= min_area
-                                         else 3 if d.get("intent") else 0),
+                 # 1 = counts toward the crowd rule (big, firm, in the zone); 3 = under
+                 # AREA_TH but in a visit (a side-on worker out of the door)
+                 2 if d is subject and in_zone else (1 if d in people_in
+                                                     else 3 if d.get("intent") else 0),
                  d.get("tid"), INTENT_TEXT.get(d.get("intent"), "")]
                 for d in persons]
             # The checklist's own item boxes (helmet, harness…) from this same tick, for the
@@ -2617,7 +2649,7 @@ def image_trigger_loop() -> None:
                 pass_timed_out, it["pass_tid"] = it["pass_tid"], None
             if now < it["next_allowed"]:
                 _dwell_clear(it)                      # cooling down; time must not accrue
-            elif len(people) > 1:
+            elif len(people_in) > 1:
                 if it["crowd_since"] is None:
                     it["crowd_since"] = now
                 # Until the crowd is confirmed the dwell timer is left strictly alone: a
@@ -2660,7 +2692,7 @@ def image_trigger_loop() -> None:
             # only evidence it leaves — and the IoU/containment figures are exactly what
             # a same-person de-duplication threshold would have to be tuned against.
             # NMS has already run at iou=0.7, so anything logged here survived that.
-            ranked = sorted(people, key=lambda d: -_area(d["box"]))
+            ranked = sorted(people_in, key=lambda d: -_area(d["box"]))
             big = ranked[0]["box"]
             parts = []
             for i, d in enumerate(ranked):
@@ -2672,10 +2704,10 @@ def image_trigger_loop() -> None:
                     s += (f" IoU={_iou(b, big):.2f}"
                           f" contain={containment(b, big):.2f}")
                 parts.append(s)
-            _image_trigger_refuse("crowd", f"{len(people)} people over {min_area} px² "
-                                           f"for {CROWD_CONFIRM_S:g} s: "
+            _image_trigger_refuse("crowd", f"{len(people_in)} people over {min_area} px² "
+                                           f"in the zone for {CROWD_CONFIRM_S:g} s: "
                                            + "  |  ".join(parts))
-            queue_alarm_record("CROWD", "crowd", f, people=len(people), box=big,
+            queue_alarm_record("CROWD", "crowd", f, people=len(people_in), box=big,
                                score=ranked[0]["score"],
                                direction=INTENT_TEXT.get(subject.get("intent") if subject else None, ""))
 
@@ -2717,15 +2749,6 @@ def _image_trigger_fire(t: float, area: int, tid=None) -> None:
         outcome = "check"
     else:
         rows = _rfid.obs.summary(t, _state["rfid_before"])
-        if _rfid.connected:
-            if rows:
-                it["deaf_tids"] = set()
-            else:
-                if not it["deaf_tids"]:
-                    it["deaf_reads"] = _rfid.obs.total_reads
-                # One person without a badge standing through several cycles is ONE
-                # person — counting dwells would call the reader deaf after ~12 s of it.
-                it["deaf_tids"].add(tid if tid is not None else object())
         near = [r for r in rows if r["rssi"] >= min_rssi]
         epcs = sorted(r["epc"] for r in near)
         heard = ", ".join(f"{r['epc']} {r['rssi']} dBm" for r in rows) or "nothing"
@@ -2812,7 +2835,15 @@ def finalize_check(ids: list[str], worker: str, preview: bool = False,
     5 fps would otherwise play 500 MP3s and drown the journal.
     """
     bursts = [_frames[i]["dets"] for i in ids]
-    res = evaluate(bursts, _state["cfg"]).to_dict()
+    cfg = _state["cfg"]
+    if source == "image":
+        # The trigger fired on a person IN the door zone; the checklist must judge that
+        # person, not a bigger bystander beside the gate (ppe_check.primary_person).
+        z = cfg.get("trigger_zone", TRIGGER_ZONE_DEFAULT)
+        w = _frames[ids[0]].get("w") or 0
+        if w and not (z[0] <= 0 and z[1] >= 1):
+            cfg = dict(cfg, subject_zone_px=[z[0] * w, z[1] * w])
+    res = evaluate(bursts, cfg).to_dict()
 
     # Report which frame the UI should display: the one evaluate() judged best.
     best = 0
@@ -3876,7 +3907,7 @@ def main():
                     help="start with the image trigger (the default trigger: a person "
                          "standing close for --image-dwell seconds fires a check) "
                          "switched off; the web UI can turn it on later")
-    ap.add_argument("--image-dwell", type=float, default=2.0,
+    ap.add_argument("--image-dwell", type=float, default=1.2,
                     help="seconds one person must stay inside the door zone, above the "
                          "area threshold, before the image trigger fires (default 2.0). "
                          f"Detection dropouts shorter than IMAGE_TRIGGER_MISS_S "

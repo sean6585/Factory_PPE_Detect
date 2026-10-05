@@ -430,6 +430,38 @@ async function saveZone(){
 new ResizeObserver(positionZoneOverlay).observe($("live"));
 new ResizeObserver(positionZoneOverlay).observe(cv);
 
+// The live frame is only --stream-height (720) px tall, and an <img> under max-width /
+// max-height shrinks to fit but never grows — on a big screen it sat in the middle of
+// the panel with a margin all round (operator, 2026-10-04: 貼齊背後方框). So while the
+// live view is up, the picture is sized to the largest box of its own shape that the
+// column has room for, and the panel hugs it ("hug"): no grey band on any side. The
+// element's box is still exactly the rendered picture, which every overlay relies on.
+// Paused, or showing an uploaded result, the panel goes back to filling the column.
+function fitLive(){
+  const img = $("live"), panel = $("imgPanel"), col = $("imgCol");
+  const on = img.classList.contains("on") && img.naturalWidth && img.naturalHeight;
+  panel.classList.toggle("hug", !!on);
+  if (!on){ img.style.width = img.style.height = ""; return; }
+  const ps = getComputedStyle(panel), cs = getComputedStyle(col);
+  const padX = parseFloat(ps.paddingLeft) + parseFloat(ps.paddingRight);
+  const padY = parseFloat(ps.paddingTop) + parseFloat(ps.paddingBottom);
+  // The room the column leaves the panel: its height less every other shown row + gaps.
+  const rows = [...col.children].filter(c => c !== panel && c.offsetParent !== null);
+  const gap = parseFloat(cs.rowGap) || 0;
+  const H = col.clientHeight - rows.reduce((a, c) => a + c.offsetHeight, 0)
+            - gap * rows.length - padY;
+  const W = col.clientWidth - padX;
+  if (W <= 0 || H <= 0) return;
+  const k = Math.min(W / img.naturalWidth, H / img.naturalHeight);
+  const w = Math.floor(img.naturalWidth * k) + "px", h = Math.floor(img.naturalHeight * k) + "px";
+  if (img.style.width !== w) img.style.width = w;
+  if (img.style.height !== h) img.style.height = h;
+}
+new ResizeObserver(fitLive).observe($("imgCol"));
+$("live").addEventListener("load", fitLive);
+// Live on/off (pause, a result taking the panel, back to live) flips #live's class.
+new MutationObserver(fitLive).observe($("live"), {attributes: true, attributeFilter: ["class"]});
+
 function applyThresholdsFromCfg(){
   if (!CFG || !CFG.cfg) return;
   if (Array.isArray(CFG.cfg.trigger_zone) && CFG.cfg.trigger_zone.length === 2){
@@ -678,7 +710,7 @@ function paintImageTrigger(s){
       multi: `${ev.epcs.length} tags → 檢測口請淨空`,
       intrusion: "walked in unchecked → 擅自闖入", fail_entered: "entered after FAIL → 檢測未通過",
       out_unchecked: "walked out unchecked → 未檢查即出場", out_fail: "left after FAIL → 未通過仍出場",
-      out_refused: "left after refusal → 被拒絕仍出場",
+      out_refused: "left after refusal → 未檢查即出場",
       pass_entry: "passed → 請進場", pass_leave: "passed → 請出場",
       unregistered: "badge not on whitelist → ID未登入"}[ev.outcome] || ev.outcome;
     txt += `  ·  last ${ev.t.slice(11)} ${what}`;
@@ -758,20 +790,26 @@ function paintAlarm(s){
   // Only while the server says it is still announcing — once that expires the screen
   // goes back to standby, so a stale verdict never greets the next worker.
   const box = $("alarmBox"), ev = (s && s.alarm_active) ? s.last_event : null;
-  let key = null, when = "";
+  let key = null, when = "", pending = false;
 
   if (ev){
     when = ev.t ? ev.t.slice(11) : "";
-    key = ev.outcome === "check"
-      ? (LAST ? ({PASS: "pass", NO_WORKER: "no_worker"}[LAST.status] || "fail") : null)
-      : ev.outcome;
+    if (ev.outcome === "check"){
+      // The server sets this event the moment the dwell completes, BEFORE the burst runs;
+      // until this check's own result is in, LAST is the PREVIOUS check, and showing it
+      // flashed a stale 「檢測通過」 for ~1 s (2026-10-05). A result belongs to the event
+      // when it is at least as new (both "YYYY-MM-DD HH:MM:SS", so strings compare).
+      const fresh = LAST && LAST.ts && ev.t && LAST.ts >= ev.t;
+      key = fresh ? ({PASS: "pass", NO_WORKER: "no_worker"}[LAST.status] || "fail") : null;
+      pending = !fresh;
+    } else key = ev.outcome;
   }
-  if (window.demoAlarm) window.demoAlarm(key, s);    // 大字報's banner (demo.js)
+  if (window.demoAlarm) window.demoAlarm(key, s, pending);   // 大字報's banner (demo.js)
   const t = key && ALARM_TEXT[key];
   if (!t){
     box.className = "idle";
-    $("alarmMain").textContent = "待命中";
-    $("alarmSub").textContent = "等待人員進入閘門";
+    $("alarmMain").textContent = pending ? "檢測中…" : "待命中";
+    $("alarmSub").textContent = pending ? "" : "等待人員進入閘門";
     $("alarmWhen").textContent = "";
     return;
   }

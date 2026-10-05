@@ -34,6 +34,13 @@
 #demo .dBadge.ng{background:#e8382a}
 #demo .dTag{font-size:5.5vh;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #demo .dTag b{color:#0a2ee6;font-weight:800;font-variant-numeric:tabular-nums}
+/* IT upload row: what happened to this check's ppe-result post (or, with no check on
+   screen, the reporter's latest state). Colour = outcome; grey = nothing to report. */
+#demo .dIt{font-size:4.6vh;line-height:1.25}      /* may wrap: a failure carries its reason */
+#demo .dIt b{font-weight:800;color:#777}
+#demo .dIt b.ok{color:#2f7d1f}
+#demo .dIt b.ng{color:#d32f2f}
+#demo .dIt b.busy{color:#c98a00}
 
 #demo .dBanner{height:var(--banner);border-radius:1.2vh;display:flex;align-items:center;justify-content:center;
                font-size:11vh;font-weight:800;color:#fff;background:#9a9a9a;letter-spacing:.06em;

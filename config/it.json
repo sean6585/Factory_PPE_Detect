@@ -1,6 +1,6 @@
 {
-  "enabled": false,
-  "target": "tsmc-test",
+  "enabled": true,
+  "target": "mock",
   "targets": {
     "tsmc-test": {
       "result_url": "http://192.168.12.30:9001/access-control-dashboard/ppe-result",

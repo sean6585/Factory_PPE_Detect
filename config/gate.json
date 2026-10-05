@@ -18,7 +18,7 @@
       "negatives": [
         "no-harness"
       ],
-      "conf": 0.7
+      "conf": 0.66
     },
     {
       "label": "Bodycam",
@@ -38,16 +38,16 @@
   "votes_required": 2,
   "containment": 0.5,
   "negative_veto": true,
-  "trigger_min_area": 190000,
-  "rfid_min_rssi": -70.0,
+  "trigger_min_area": 200000,
+  "rfid_min_rssi": -65.0,
   "trigger_zone": [
-    0.284,
-    0.722
+    0.288,
+    0.67
   ],
-  "model": "yolo11n_PPE_0920.engine",
-  "direction_source": "track",
-  "rfid_power_dbm": 24.0,
-  "rfid_rf_mode": 345,
+  "model": "lite_1006_0008.engine",
+  "direction_source": "it",
+  "rfid_power_dbm": 14.0,
+  "rfid_rf_mode": 302,
   "door_side": "left",
   "track_person_conf": 0.6,
   "exit_area_fraction": 0.9,

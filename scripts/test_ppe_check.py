@@ -110,6 +110,22 @@ check("off-worker detections ignored", r.items[0].seen_score, HAT["score"])
 r = evaluate([[d("Hardhat", 0.9, HAT["box"])]], cfg)
 check("no worker -> no item rows, so no scores", r.items, [])
 
+print("12. subject zone: only a person whose centre is in the zone can be the worker")
+BIG_OUT = person([700, 50, 1000, 700])                  # bigger, but beside the gate
+cfg_z = copy.deepcopy(cfg); cfg_z["subject_zone_px"] = [50, 400]
+r = evaluate([[person(WORKER), HAT, VEST, MASK, BIG_OUT]], cfg)
+check("no zone: the bigger bystander is judged", r.person_box, [700.0, 50.0, 1000.0, 700.0])
+r = evaluate([[person(WORKER), HAT, VEST, MASK, BIG_OUT]], cfg_z)
+check("zone: the worker in it is judged",        r.person_box, [100.0, 100.0, 300.0, 600.0])
+check("zone: and passes on their own PPE",       r.status, "PASS")
+check("zone: the bystander is still counted",    r.extra_people, 1)
+dets = [person(WORKER), HAT, VEST, MASK, BIG_OUT]
+r2 = evaluate([dets], cfg_z)
+check("person_index points at the worker",       dets[r2.person_index]["box"], WORKER)
+r = evaluate([[BIG_OUT, d("Hardhat", 0.9, [750, 60, 850, 150])]], cfg_z)
+check("nobody in the zone -> NO_WORKER",         r.status, "NO_WORKER")
+check("...never a pass",                         r.passed, False)
+
 print()
 if fails:
     print(f"{len(fails)} FAILURE(S):")

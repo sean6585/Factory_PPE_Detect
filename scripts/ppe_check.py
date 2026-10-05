@@ -147,13 +147,24 @@ class CheckResult:
 
 # ── core ──────────────────────────────────────────────────────────────────
 def primary_person(dets: Iterable[dict], cfg: dict):
-    """Largest Person box above threshold — at a gate, largest means closest."""
+    """Largest Person box above threshold — at a gate, largest means closest.
+
+    cfg["subject_zone_px"] = [x_left, x_right] (optional, pixels): only a person whose
+    box centre lies between them can be the worker — the image trigger's door zone
+    (2026-10-05). Without it a bystander standing closer to the camera but beside the
+    gate, bigger than the worker in it, would be the one judged. No one in the zone is
+    no worker: NO_WORKER, never a PASS. The second value counts every other person."""
     people = [d for d in dets
               if d["name"] == cfg["person_class"] and d["score"] >= cfg["person_conf"]]
     if not people:
         return None, 0
-    people.sort(key=lambda d: -_area(d["box"]))
-    return people[0], len(people) - 1
+    zone = cfg.get("subject_zone_px")
+    cands = people if not zone else [
+        d for d in people if zone[0] <= (d["box"][0] + d["box"][2]) / 2 <= zone[1]]
+    if not cands:
+        return None, len(people)
+    cands.sort(key=lambda d: -_area(d["box"]))
+    return cands[0], len(people) - 1
 
 
 def evaluate(frames_dets: list[list[dict]], cfg: dict | None = None) -> CheckResult:
