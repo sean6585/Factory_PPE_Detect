@@ -247,8 +247,18 @@ empties See Records. Add columns; don't reorder or rename them.
         guard below still applies.
       - A walk-away exit re-arms at once (`rearm`): #394 was confirmed gone on the tick it
         turned, never under the line again, and its walk back in went unjudged.
-      - **Exit area** (`exit_roi`, the page's 「畫出場區」 under the picture — drag a rectangle,
-        「清除」 takes a second press; 2026-10-09): when set, every way of going OUT (walked
+      - **Check spot = exit area, one rectangle** (operator, 2026-10-09 evening, 共用方框):
+        with `exit_roi` set the image trigger's dwell (and the 3 dwell frames of the vote)
+        only counts while the subject's FEET are inside it (`_on_spot`, status `on_spot`,
+        page text 「腳不在檢測位置」, tick log `on_spot`); size / zone / one-person rules are
+        unchanged and the crowd rule ignores it (two big people in the zone still refuse).
+        Edges within 1 % of the frame border snap to it (`EXIT_ROI_SNAP`, on read and on
+        save): at the gate the feet are at the very bottom, y2 = 960 (cut off) 17-24 % of
+        the time, and the home box's bottom edge at 0.9977 left those outside. The cost of
+        sharing, accepted: standing on the spot already satisfies the exit condition below,
+        so it no longer guards against a crouch read as walking away (#245). Off = both off.
+      - **Exit area** (`exit_roi`, the page's 「畫檢測／出場區」 under the picture — drag a
+        rectangle, 「清除」 takes a second press; 2026-10-09): when set, every way of going OUT (walked
         away, out of view, the unrestricted side) also needs the worker's FEET — the
         bottom-centre of the box — to have been inside it at some point of the visit
         (`feet_out`); judged gone without that = not out yet (journal: "feet never entered

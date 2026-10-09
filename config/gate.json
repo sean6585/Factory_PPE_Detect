@@ -50,8 +50,8 @@
   "rfid_rf_mode": 103,
   "door_side": "both",
   "track_person_conf": 0.6,
-  "exit_area_fraction": 0.85,
-  "away_fraction": 0.75,
+  "exit_area_fraction": 1.0,
+  "away_fraction": 0.8,
   "rfid_antenna_settings": {
     "1": {
       "power_dbm": 19.0,

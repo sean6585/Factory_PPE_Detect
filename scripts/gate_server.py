@@ -1550,6 +1550,15 @@ def set_vanish_exit_s(seconds) -> dict:
 # visit: judged gone (walked away, out of view) but never actually stepped out = not out
 # yet. Off (None) = no such condition. Only exits read it; entries do not.
 EXIT_ROI_MIN_SIZE = 0.02      # a rectangle thinner than 2 % of the frame is a stray click
+# An edge drawn within this of the frame's border IS the border. At the gate the feet are
+# at the very bottom — 17-24 % of the time cut off by it, y2 exactly 960 (recordings
+# 20261009_143959, 20261008_195448) — and a hand-drawn bottom edge at 0.9977 left all of
+# those outside the box. Applied when reading too, so a box drawn before needs no redraw.
+EXIT_ROI_SNAP = 0.01
+
+
+def _snap(v: float) -> float:
+    return 0.0 if v <= EXIT_ROI_SNAP else 1.0 if v >= 1.0 - EXIT_ROI_SNAP else v
 
 
 def exit_roi():
@@ -1559,6 +1568,9 @@ def exit_roi():
         x1, y1, x2, y2 = (float(v) for v in r)
     except (TypeError, ValueError):
         return None
+    if not all(0 <= v <= 1 for v in (x1, y1, x2, y2)):
+        return None                       # hand-edited nonsense: off, not "fixed"
+    x1, y1, x2, y2 = _snap(x1), _snap(y1), _snap(x2), _snap(y2)
     if not (0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1):
         return None
     if x2 - x1 < EXIT_ROI_MIN_SIZE or y2 - y1 < EXIT_ROI_MIN_SIZE:
@@ -1572,7 +1584,7 @@ def set_exit_roi(rect) -> dict:
         _state["cfg"]["exit_roi"] = None
     else:
         try:
-            r = [round(min(max(float(v), 0.0), 1.0), 4) for v in rect]
+            r = [round(_snap(min(max(float(v), 0.0), 1.0)), 4) for v in rect]
         except (TypeError, ValueError):
             raise ValueError("The exit area must be four numbers")
         if len(r) != 4:
@@ -2119,6 +2131,7 @@ _image_trigger = {
     "person_area": 0,        # subject's box area on the last tick, for the UI
     "person_cx": None,       # ...and its centre x as a fraction of frame width
     "in_zone": False,        # ...and whether that centre is inside cfg trigger_zone
+    "on_spot": False,        # ...and its feet on the check spot (exit_roi; True when none)
     "people": 0,             # how many boxes cleared the area threshold this tick
     "boxes": [],             # this tick's person boxes, normalised, for the overlay
     "ppe": [],               # ...and the checklist's item boxes (helmet, harness, vetoes)
@@ -2167,6 +2180,7 @@ def _image_trigger_status() -> dict:
             "person_area": it["person_area"],
             "person_cx": it["person_cx"],
             "in_zone": it["in_zone"],
+            "on_spot": it["on_spot"],
             "people": it["people"],
             "boxes": it["boxes"],
             "ppe": it["ppe"],
@@ -2568,6 +2582,13 @@ def _feet_in_exit_roi(b, w: int, h: int) -> bool:
         return False
     fx, fy = (b[0] + b[2]) / 2 / w, b[3] / h
     return r[0] <= fx <= r[2] and r[1] <= fy <= r[3]
+
+
+def _on_spot(b, w: int, h: int) -> bool:
+    """May this box run the image trigger's dwell? The exit area doubles as the CHECK
+    SPOT (operator, 2026-10-09, one box for both): with it set, only while the person's
+    feet are inside it; with none, always. The crowd rule does not look at it."""
+    return exit_roi() is None or _feet_in_exit_roi(b, w, h)
 
 
 def _feet_ok(v: dict) -> bool:
@@ -3062,6 +3083,10 @@ def image_trigger_loop() -> None:
         cx = (round((subject["box"][0] + subject["box"][2]) / 2 / W, 3)
               if subject else None)
         in_zone = subject is not None and subject in people_in
+        # ...and, with a check spot drawn, standing on it: feet (the box's bottom-centre)
+        # inside the exit_roi rectangle. Only the dwell needs it; two people in the zone
+        # still refuse whether or not they are on the spot (operator, 2026-10-09).
+        on_spot = in_zone and _on_spot(subject["box"], W, f.shape[0])
         now = time.monotonic()
         # Before the dwell logic, and on every tick including the cooldown: a second
         # person slipping through while the gate is still cooling down after a pass is
@@ -3071,7 +3096,7 @@ def image_trigger_loop() -> None:
         except Exception as e:
             print(f"[visit] update failed: {type(e).__name__}: {e}", flush=True)
         subject_tid = subject.get("tid") if subject else None
-        if in_zone:
+        if on_spot:               # the frames the dwell counts — 3 of the check's 5 votes
             _pre_burst.append({"t": now, "f": f, "dets": dets, "tid": subject_tid})
         outcome = None
         with it["lock"]:
@@ -3079,6 +3104,7 @@ def image_trigger_loop() -> None:
             it["person_area"] = area
             it["person_cx"] = cx
             it["in_zone"] = in_zone
+            it["on_spot"] = on_spot
             it["people"] = len(people_in)
             it["subject_intent"] = subject.get("intent") if subject else None
             # Every person box the tick saw, normalised, for the live overlay. Boxes
@@ -3142,7 +3168,7 @@ def image_trigger_loop() -> None:
                     outcome = "crowd"
                     _dwell_clear(it)
                     it["next_allowed"] = now + IMAGE_TRIGGER_COOLDOWN_S
-            elif subject is not None and in_zone:
+            elif on_spot:
                 it["crowd_since"] = None
                 it["miss_since"] = None               # recovered — the timer runs on
                 if it["dwell_start"] is None:
@@ -3164,7 +3190,7 @@ def image_trigger_loop() -> None:
         _rec_log("tick", dets=[[d["name"], round(d["score"], 3)] + [int(v) for v in d["box"]]
                                + ([d.get("tid")] if d["name"] == cfg["person_class"] else [])
                                for d in dets],
-                 subject=subject_tid, in_zone=in_zone, people=len(people_in),
+                 subject=subject_tid, in_zone=in_zone, on_spot=on_spot, people=len(people_in),
                  dwell=round(now - it["dwell_start"], 2) if it["dwell_start"] else None,
                  outcome=outcome)
         if pass_timed_out is not None:

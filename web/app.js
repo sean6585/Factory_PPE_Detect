@@ -224,15 +224,21 @@ function positionZoneOverlay(){
   ov.classList.add("on");
 }
 
-// ── exit area (exit_roi) ────────────────────────────────────────────────
-// The floor a leaving worker steps onto. When it is set, the gate counts an exit only once
-// the worker's FEET — the bottom-centre of their box — have been in it: judged gone
-// (walked away, out of view) but never stepped out = not out yet. Drawn by dragging on the
-// picture after pressing 畫出場區; stored as fractions of the frame, like the door zone,
-// so it means the same on the live stream, the 1280 frame the gate judges and a result.
+// ── check spot / exit area (exit_roi) ───────────────────────────────────
+// One rectangle, two jobs (operator, 2026-10-09). The image trigger's dwell only runs while
+// the person's FEET — the bottom-centre of their box — are in it; and an exit only counts
+// once the worker's feet have been in it (judged gone without that = not out yet). Drawn
+// by dragging on the picture after pressing 畫檢測／出場區; stored as fractions of the frame,
+// like the door zone, so it means the same on the live stream, the 1280 frame the gate
+// judges and a result. The server snaps an edge within 1 % of the border to the border.
 let EXIT_ROI = null;          // [x1, y1, x2, y2] fractions, or null = off
 let ROI_DRAW = null;          // armed: {} before the press, {x0, y0, x1, y1} while dragging
 let ROI_CLEAR_TIMER = null;   // 清除 asks for a second press within 3 s
+
+// The server's EXIT_ROI_SNAP, so the feet dots agree with what the gate decides.
+function snapRoi(r){
+  return r && r.map(v => v <= 0.01 ? 0 : v >= 0.99 ? 1 : v);
+}
 
 function roiRect(d){
   return [Math.min(d.x0, d.x1), Math.min(d.y0, d.y1), Math.max(d.x0, d.x1), Math.max(d.y0, d.y1)];
@@ -257,8 +263,8 @@ function positionExitRoi(){
 
 function paintExitRoiBtns(){
   $("exitRoiDraw").classList.toggle("on", !!ROI_DRAW);
-  $("exitRoiDraw").textContent = ROI_DRAW ? "在畫面上拖曳框出出場區…（Esc 取消）"
-                               : EXIT_ROI ? "重畫出場區" : "畫出場區";
+  $("exitRoiDraw").textContent = ROI_DRAW ? "在畫面上拖曳框出檢測／出場區…（Esc 取消）"
+                               : EXIT_ROI ? "重畫檢測／出場區" : "畫檢測／出場區";
   $("exitRoiClear").hidden = !EXIT_ROI || !!ROI_DRAW;
 }
 
@@ -268,8 +274,8 @@ async function saveExitRoi(rect){
       headers: {"Content-Type": "application/json"}, body: JSON.stringify({rect})});
     const d = await r.json().catch(() => ({error: `HTTP ${r.status}`}));
     if (!r.ok || d.error) throw new Error(d.error || `HTTP ${r.status}`);
-    EXIT_ROI = d.exit_roi;
-    if (CFG) CFG.cfg.exit_roi = EXIT_ROI;
+    EXIT_ROI = snapRoi(d.exit_roi);
+    if (CFG) CFG.cfg.exit_roi = d.exit_roi;
   }catch(e){ $("err").textContent = "Could not save the exit area: " + e.message; }
   paintExitRoiBtns(); positionExitRoi();
 }
@@ -310,7 +316,7 @@ document.addEventListener("keydown", e => { if (e.key === "Escape" && ROI_DRAW) 
 $("exitRoiClear").onclick = () => {
   const b = $("exitRoiClear");
   if (!b.classList.contains("arming")){
-    b.classList.add("arming"); b.textContent = "再按一次：清除出場區";
+    b.classList.add("arming"); b.textContent = "再按一次：清除檢測／出場區";
     ROI_CLEAR_TIMER = setTimeout(() => { b.classList.remove("arming"); b.textContent = "清除"; }, 3000);
     return;
   }
@@ -599,7 +605,7 @@ function applyThresholdsFromCfg(){
   if (CFG.cfg.away_fraction != null) AWAY_FRAC = Number(CFG.cfg.away_fraction);
   if (CFG.cfg.vanish_exit_s != null) VANISH_S = Number(CFG.cfg.vanish_exit_s);
   EXIT_ROI = Array.isArray(CFG.cfg.exit_roi) && CFG.cfg.exit_roi.length === 4
-    ? CFG.cfg.exit_roi.map(Number) : null;
+    ? snapRoi(CFG.cfg.exit_roi.map(Number)) : null;
   paintExitRoiBtns(); positionExitRoi();
   paintDwell(CFG.cfg.image_dwell);
   if (CFG.cfg.trigger_min_area != null){
@@ -834,6 +840,9 @@ function paintImageTrigger(s){
     if (s.miss > 0) txt += ` · missed ${s.miss}/${s.miss_limit}s`;
   }
   else if (s.person_area > 0 && !s.in_zone) txt = `${at} — outside door zone (centre ${Math.round((s.person_cx ?? 0) * 100)}%)`;
+  // In the zone and big enough, but the feet are off the check spot (exit_roi): the
+  // dwell waits — said here, or a worker standing beside the spot looks ignored.
+  else if (s.person_area > 0 && s.on_spot === false) txt = `${at} · in zone — 腳不在檢測位置`;
   else if (s.person_area > 0) txt = `${at} · in zone`;
   else txt = "watching · nobody";
   if (s.last_event){

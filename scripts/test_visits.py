@@ -541,6 +541,26 @@ for bad in ([0.5, 0.6, 0.4, 0.8], [0.3, 0.6, 0.7], [-0.1, 0.6, 0.7, 0.8], "x", N
 gs._state["cfg"].pop("exit_roi")
 reset()
 
+print("32. the box is also the CHECK SPOT: the dwell needs the feet on it (2026-10-09)")
+reset()
+check("no box drawn: anyone may dwell", gs._on_spot(box(0.5, 400000), W, 960), True)
+gs._state["cfg"]["exit_roi"] = [0.3, 0.6, 0.7, 0.88]
+check("feet on the spot (y 800)", gs._on_spot(box(0.5, 400000, feet=800), W, 960), True)
+check("feet below it (y 900)", gs._on_spot(box(0.5, 400000), W, 960), False)
+check("feet beside it (x 0.8)", gs._on_spot(box(0.8, 400000, feet=800), W, 960), False)
+# The box the operator drew at home: bottom edge 0.9977 — the feet at the gate are cut off
+# by the frame, y2 = 960 exactly, 17-24 % of the time. Within 1 % of the border = the border.
+gs._state["cfg"]["exit_roi"] = [0.2895, 0.8396, 0.6586, 0.9977]
+check("bottom edge snapped to the frame", gs.exit_roi(), [0.2895, 0.8396, 0.6586, 1.0])
+check("feet cut off at the bottom (y2 960): on the spot",
+      gs._on_spot([500, 300, 700, 960], W, 960), True)
+_saved = gs.save_config
+gs.save_config = lambda: None                    # never touch a real gate.json from a test
+check("saving snaps too", gs.set_exit_roi([0.005, 0.5, 0.6, 0.995])["exit_roi"], [0.0, 0.5, 0.6, 1.0])
+gs.save_config = _saved
+gs._state["cfg"].pop("exit_roi")
+reset()
+
 print("22. the check votes on the dwell's last 3 frames + 2 new ones (2026-10-07)")
 _saved = {k: getattr(gs, k) for k in ("latest_frame", "detect", "finalize_check", "queue_record")}
 voted = {}
