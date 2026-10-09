@@ -39,14 +39,18 @@
   <input type="range" id="areaSlider" min="0" max="1228800" step="100" value="10000">
   <span id="areaMax" class="areaNum"></span>
   <span class="tag">px&sup2;</span>
-  <label class="tag" for="exitFrac" title="For a track that came from the door's side (出場). Under 1: their visit starts at this fraction of the area threshold — a worker stepping out sideways has a smaller box — and the check still needs the full threshold. Over 1: they must be this much BIGGER than the threshold both to be followed and to be checked — a worker leaving comes out by the door near the camera and walks away, box big to small. Everyone else needs the plain threshold. Saved in gate.json.">出場（門那側來）&times;</label>
+  <label class="tag" for="exitFrac" title="For a track that came from the restricted area's side (出場) — the stairs up to the ceiling. Under 1: their visit starts at this fraction of the area threshold — a worker stepping out sideways has a smaller box — and the check still needs the full threshold. Over 1: they must be this much BIGGER than the threshold both to be followed and to be checked — a worker leaving comes down from the restricted area near the camera and walks away, box big to small. Everyone else needs the plain threshold. Saved in gate.json.">出場（管制區那側來）&times;</label>
   <input type="number" id="exitFrac" class="areaInput" min="0.2" max="2" step="0.05" value="0.60"
          title="0.2 – 2.0 · Enter or click away to save">
   <span class="tag" id="exitFracPx">&hellip;</span>
-  <label class="tag" for="awayFrac" title="A visit's box shrinking below this fraction of the area threshold (held 0.3 s) counts as walking away from the camera: the way out for 出場, turning back for 進場. Higher = reported sooner, but above ~0.7 a worker turning side-on to the door (box ~55-65 % of front-on) may read as walking away. 0.5 suits a long approach path. Saved in gate.json.">走遠線 &times;</label>
+  <label class="tag" for="awayFrac" title="A visit's box shrinking below this fraction of the area threshold (held 0.3 s) counts as walking away from the camera: the way out for 出場, turning back for 進場. Higher = reported sooner, but above ~0.7 a worker turning side-on (box ~55-65 % of front-on) may read as walking away. 0.5 suits a long approach path. Saved in gate.json.">走遠線 &times;</label>
   <input type="number" id="awayFrac" class="areaInput" min="0.3" max="0.8" step="0.05" value="0.50"
          title="0.3 – 0.8 · Enter or click away to save">
   <span class="tag" id="awayFracPx">&hellip;</span>
+  <label class="tag" for="vanishSec" title="A worker leaving (出場) who is out of view this long while inside the zone has walked behind a wall: counted as gone out, like walking away. Short = the alarm comes at once, but the detector missing someone that long reads as an exit too (the same ID coming back carries on with its visit). Saved in gate.json.">消失即出場</label>
+  <input type="number" id="vanishSec" class="areaInput" min="0.3" max="3.5" step="0.1" value="0.5"
+         title="0.3 – 3.5 s · Enter or click away to save">
+  <span class="tag">秒</span>
   <span style="width:14px"></span>
   <label class="tag chk" title="Also draw every prediction the checklist did NOT judge: PPE on other people, NO-* classes, anything else above its threshold. Bypasses the area filter. Dashed blue = prediction only, not a verdict.">
     <input type="checkbox" id="showAll"> show all predictions
@@ -75,8 +79,10 @@
         <div class="zoneShade" id="zoneShadeR"></div>
         <div class="zoneEdge" id="zoneEdgeL"></div>
         <div class="zoneEdge" id="zoneEdgeR"></div>
-        <div class="doorMark" id="doorMark">門 · 管制區</div>
+        <div class="doorMark" id="doorMark">管制區</div>
       </div>
+      <div id="exitRoi"><span class="exitRoiMark">出場區</span></div>
+      <div id="exitRoiLayer"></div>
       <canvas id="trackCv"></canvas>
       <button id="toLive">&#9654; Back to live</button>
       <div id="imgHint">Waiting for a check&hellip;</div>
@@ -91,7 +97,7 @@
       </div>
       <span class="areaNum" id="zoneVal">0% &ndash; 100%</span>
       <span class="tag" id="zoneHint">whole frame</span>
-      <label class="tag dirLabel" for="doorSide" title="Which side of the CAMERA IMAGE the door into the restricted area is on. Came from that side = 出場; leaving the zone towards it = going in. The camera faces the worker, so the floor plan's left is usually the picture's right — check by watching a worker walk to the door on the live view. Saved in gate.json.">門在畫面</label>
+      <label class="tag dirLabel" for="doorSide" title="Which side of the CAMERA IMAGE the restricted area (the stairs up to the ceiling) is on. Came from that side = 出場; leaving the zone towards it = going in. 左 &amp; 右: it is on both sides. The camera faces the worker, so the floor plan's left is usually the picture's right — check by watching a worker walk into it on the live view. Saved in gate.json.">管制區在畫面</label>
       <select id="doorSide">
         <option value="left">&#9664; 左</option>
         <option value="right">右 &#9654;</option>
@@ -101,6 +107,8 @@
       <input type="number" id="dwellSec" class="areaInput" min="0.3" max="5" step="0.1" value="1.2"
              title="0.3 – 5 s · Enter or click away to save">
       <span class="tag">秒</span>
+      <button id="exitRoiDraw" class="trig" title="The exit area: the floor a leaving worker steps onto. When it is set, an exit (walked away, or out of view) only counts once the worker's FEET — the bottom-centre of their box — have been inside it; judged gone without ever stepping out = not out yet. Entries are not affected. Press, then drag a rectangle on the picture; release saves it to gate.json. Esc cancels.">畫出場區</button>
+      <button id="exitRoiClear" class="trig" hidden title="Remove the exit area: exits no longer wait for the feet. Asks for a second press.">清除</button>
     </div>
     <div id="liveToggleBar">
       <button id="liveToggle">&#9208; Pause live view</button>
@@ -152,6 +160,7 @@
     <div id="summary">
       <div><span class="lab">Worker ID:</span> <span class="val" id="worker">—</span></div>
       <div><span class="lab">PPE Check:</span> <span id="verdict" class="idle">—</span></div>
+      <div title="進場 / 出場 of the person at the gate now, as the gate judges it (IT's answer once it replied, else where the track came from). With nobody there, the checked worker's while their result is on the panel."><span class="lab">進出場:</span> <span class="val" id="direction">—</span></div>
     </div>
     <button id="trigger">CAPTURE &amp; CHECK</button>
   </div>

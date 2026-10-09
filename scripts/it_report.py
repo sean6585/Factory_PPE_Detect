@@ -167,8 +167,8 @@ def result_forms(ev: dict, cfg: dict) -> list[tuple[dict, str, str]]:
             # frame of the refusal. Once per badge per visit: a worker standing there is
             # refused again every few seconds, but that is one event, not a stream.
             epc = c.get("epc", "")
-            if epc in unregistered_sent:
-                continue
+            if epc in unregistered_sent or _already_sent(c):
+                continue                # _already_sent: carried into a reopened visit
             unregistered_sent.add(epc)
             fields = {"time": local_to_utc(c["ts"]), "rfid": epc, "ppeResult": "Fail"}
             for field in cfg["item_fields"].values():

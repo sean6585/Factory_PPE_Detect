@@ -37,12 +37,12 @@ FRAME = np.zeros((960, 1280, 3), np.uint8)
 W = FRAME.shape[1]
 
 
-def box(cx, area, aspect=0.6):
-    """A person box centred at cx (fraction of width) with this area, feet at y=900."""
+def box(cx, area, aspect=0.6, feet=900):
+    """A person box centred at cx (fraction of width) with this area, feet at y=feet."""
     w = math.sqrt(area * aspect)
     h = area / w
     x = cx * W
-    return [x - w / 2, 900 - h, x + w / 2, 900]
+    return [x - w / 2, feet - h, x + w / 2, feet]
 
 
 class Walk:
@@ -52,11 +52,20 @@ class Walk:
     def __init__(self, tid):
         self.tid = tid
 
-    def at(self, cx, area, ticks=1, aspect=0.6, firm=True):
-        """firm=False: a box between track_person_conf and person_conf — followed only."""
+    def at(self, cx, area, ticks=1, aspect=0.6, firm=True, feet=900):
+        """firm=False: a box between track_person_conf and person_conf — followed only.
+        feet: the box's bottom edge (y, of 960) — what the exit area (exit_roi) reads."""
         for _ in range(ticks):
             Walk.t += 0.1
-            gs._visit_update([{"box": box(cx, area, aspect), "tid": self.tid, "firm": firm}],
+            gs._visit_update([{"box": box(cx, area, aspect, feet), "tid": self.tid, "firm": firm}],
+                             AREA_TH, ZONE, Walk.t, FRAME)
+        return self
+
+    def raw(self, b, ticks=1, firm=True):
+        """An explicit box — e.g. one cut off by the image edge, which box() cannot make."""
+        for _ in range(ticks):
+            Walk.t += 0.1
+            gs._visit_update([{"box": list(b), "tid": self.tid, "firm": firm}],
                              AREA_TH, ZONE, Walk.t, FRAME)
         return self
 
@@ -187,9 +196,10 @@ reset()
 Walk(15).at(0.15, 200000, 3).at(0.5, 200000, 3).shrink(0.5, 200000).gone()
 check("no visit", outcome(events()), [])
 
-print("14. out of the door AT the exit bar, smaller in the band, grows past the bar there")
-# Since 2026-10-09 the door-side sighting itself must reach the bar (0.6 × 300k = 180k
-# here): 「面積也要大於門檻」. What it does in the band afterwards is as before.
+print("14. out of the restricted side, smaller in the band, grows past the exit bar there")
+# The restricted-side sighting counts whatever its size (operator, 2026-10-09: the sides
+# are walled stairs beside the camera — nobody there is far away). The 10-09 morning rule
+# that it must already be at the bar is gone.
 reset()
 Walk(16).at(0.85, 190000, 3).at(0.6, 160000).at(0.55, 190000).at(0.5, 220000, 3) \
     .shrink(0.5, 220000).gone()
@@ -197,8 +207,8 @@ check("still 出場", outcome(events()), [("out", "out", "away", "未檢查即�
 reset()
 Walk(18).at(0.85, 160000, 3).at(0.6, 160000).at(0.55, 190000).at(0.5, 320000, 3) \
     .shrink(0.5, 320000).gone()
-check("under the bar on the door side: not out of the door (進場, walked off = back)",
-      outcome(events()), [("in", "back", "away", None)])
+check("under the bar on the restricted side: still 出場",
+      outcome(events()), [("out", "out", "away", "未檢查即出場")])
 
 print("15. far away in the middle wipes the door origin: walking up from there is 進場")
 reset()
@@ -238,7 +248,8 @@ def replay(tid):
     w.at(0.6, 1.85 * AREA_TH).at(0.7, 1.85 * AREA_TH).gone()   # back through the door
 reset()
 replay(20)
-check("walk-away line 0.5: only a turn-back", outcome(events()), [("out", "back", "edge", None)])
+check("walk-away line 0.5: not gone, so back into the restricted side is an entry",
+      outcome(events()), [("in", "in", "edge", "未檢查即進入")])
 reset()
 gs._state["cfg"]["away_fraction"] = 0.65
 replay(21)
@@ -365,12 +376,169 @@ check("walks up, in through the RIGHT: 進場 through", outcome(events()), [("in
 w = Walk(65)
 for f in (0.3, 0.5, 0.8, 1.1, 1.4):
     w.at(0.85, f * AREA_TH)                          # up the hall along the right, small first
-w.at(0.5, BIG, 3).at(0.2, BIG).gone()
-check("along the right from far away: 進場, not out of the door",
+w.at(0.5, BIG, 3)
+# Since the afternoon of 2026-10-09 a restricted-side sighting is 出場 whatever its size:
+# the sides never hold anyone far away — the ROI's edges must take in the whole hallway.
+check("small on the right side first: 出場 (the side is never far away)",
+      gs._visits[65]["intent"], "out")
+w.at(0.2, BIG).gone()
+check("...and crossing into the left side is an entry all the same",
       outcome(events()), [("in", "in", "edge", "未檢查即進入")])
 Walk(66).at(0.15, BIG, 3).at(0.5, BIG, 3).at(0.85, BIG).gone()
-check("out of the left, back in on the right: 出場 → back", outcome(events()), [("out", "back", "edge", None)])
+check("out of the left, back in on the right: an entry (2026-10-09 算進場)",
+      outcome(events()), [("in", "in", "edge", "未檢查即進入")])
 gs._state["cfg"].pop("exit_area_fraction"); gs._state["cfg"]["door_side"] = "right"
+reset()
+
+print("26. out of the restricted side half in frame: a small box cut by the image edge (2026-10-09)")
+# Recording 20261009_143959 #394/#401/#405: the first boxes were x 0-141 at 120-135k
+# (gate frame), read as 進場 under the area bar the origin used to need.
+reset()
+gs._state["cfg"].update(door_side="both")
+Walk(70).raw([0, 300, 141, 960]).raw([0, 250, 224, 960]).raw([0, 200, 300, 960]) \
+    .at(0.5, 400000, 3).shrink(0.5, 400000).gone()
+check("cut by the LEFT edge, small: 出場", outcome(events()), [("out", "out", "away", "未檢查即出場")])
+Walk(71).raw([1139, 300, 1280, 960]).raw([1056, 250, 1280, 960]).at(0.5, 400000, 3) \
+    .shrink(0.5, 400000).gone()
+check("cut by the RIGHT edge, small: 出場", outcome(events()), [("out", "out", "away", "未檢查即出場")])
+gs._state["cfg"]["door_side"] = "right"
+reset()
+
+print("27. 出場 and out of view inside the band = walked behind a wall: through (2026-10-09)")
+reset()
+gs._state["cfg"].update(door_side="both")
+Walk(72).at(0.15, 400000, 3).at(0.5, 400000, 3).gone()
+check("vanished: 未檢查即出場 via vanish", outcome(events()), [("out", "out", "vanish", "未檢查即出場")])
+check("spoken", said, ["exit_unchecked"])
+reset()
+Walk(73).at(0.15, 400000, 3).at(0.5, 400000, 3)._pass().gone()
+check("PASS, then vanished: through, no alarm", (outcome(events()), said),
+      ([("out", "out", "vanish", None)], []))
+check("PASS window closed", gs._image_trigger["pass_tid"], None)
+reset()
+w = Walk(74)
+for f in (0.3, 0.6, 1.0, 1.3):
+    w.at(0.5, f * AREA_TH)                           # walked up the hall: 進場
+w.at(0.5, 1.3 * AREA_TH, 3).gone()
+check("進場 out of view: lost, as before", outcome(events()), [("in", "unknown", None, None)])
+reset()
+w = Walk(80).at(0.15, 400000, 3).at(0.5, 400000, 3)
+for cx, a in ((0.48, 300000), (0.46, 330000), (0.44, 370000), (0.42, 410000), (0.40, 450000)):
+    w.at(cx, a)                                      # coming back towards the camera...
+w.gone()                                             # ...lost at the dark edge (#127)
+check("out of view while coming TOWARDS the camera: lost, no exit (2026-10-08 #127)",
+      (outcome(events()), said), ([("out", "unknown", None, None)], []))
+reset()
+w = Walk(81).at(0.15, 400000, 3).at(0.5, 400000, 3)
+for a in (380000, 340000, 300000, 260000, 230000):
+    w.at(0.5, a)                                     # walking away, still above the line...
+w.gone()                                             # ...hidden behind others (#198)
+check("out of view while walking AWAY: through (2026-10-08 #198)",
+      outcome(events()), [("out", "out", "vanish", "未檢查即出場")])
+reset()
+gs._state["cfg"]["vanish_exit_s"] = 1.0
+w = Walk(75).at(0.15, 400000, 3).at(0.5, 400000, 3).gone(0.8)
+check("vanish_exit_s 1.0: nothing at 0.8 s", outcome(events()), [])
+w.gone(0.5)
+check("...through at 1.0 s", outcome(events()), [("out", "out", "vanish", "未檢查即出場")])
+gs._state["cfg"]["vanish_exit_s"] = 9
+check("capped at 3.5 s", gs.vanish_exit_s(), 3.5)
+gs._state["cfg"].pop("vanish_exit_s")
+check("default 0.5 s", gs.vanish_exit_s(), 0.5)
+gs._state["cfg"]["door_side"] = "right"
+reset()
+
+print("28. a dropout, then the same ID back: the visit goes on, its PASS kept, nothing sent twice")
+import it_report
+reset()
+gs._state["cfg"].update(door_side="both")
+w = Walk(76).at(0.15, 400000, 3).at(0.5, 400000, 3)._pass().gone(0.7)
+first = events()
+check("the dropout read as an exit (accepted: no delay)", outcome(first), [("out", "out", "vanish", None)])
+w.at(0.5, 400000, 3)
+v = gs._visits[76]
+check("same ID back: reopened, still 出場", (v["resolved"], v["intent"]), (False, "out"))
+check("its PASS kept", [c["status"] for c in v["checks"]], ["PASS"])
+w.shrink(0.5, 400000).gone()
+second = events()
+check("walks away: through, no second alarm", (outcome(second), said),
+      ([("out", "out", "away", None)], []))
+check("the PASS goes to IT with the first line only",
+      ([it_report._already_sent(c) for c in first[0]["checks"]],
+       [it_report._already_sent(c) for c in second[0]["checks"]]), ([False], [True]))
+gs._state["cfg"]["door_side"] = "right"
+reset()
+
+print("30. walks away just past the line and turns straight back: the way back is a new visit")
+# Recording 20261009_143959 #394: the walk-away was confirmed on the tick it turned, the
+# box never under the line again — the visit never re-armed, so walking back into the
+# left side went unjudged.
+reset()
+gs._state["cfg"].update(door_side="both")
+w = Walk(82).at(0.15, 400000, 3).at(0.5, 400000, 3)
+for a in (360000, 324000, 291000, 262000, 236000, 212000, 191000, 172000, 155000,
+          139000, 125000, 113000, 102000, 92000):
+    w.at(0.5, a)                                     # confirmed gone at 92k...
+w.at(0.5, 160000).at(0.5, 250000).at(0.5, 350000, 3).at(0.2, 350000).gone()   # ...straight back
+check("exit, then the way back in judged", outcome(events()),
+      [("out", "out", "away", "未檢查即出場"), ("in", "in", "edge", "未檢查即進入")])
+gs._state["cfg"]["door_side"] = "right"
+reset()
+
+print("29. out of the restricted side, then straight back into it = 進場 (2026-10-09 算進場)")
+reset()
+gs._state["cfg"].update(door_side="both")
+Walk(77).at(0.15, 400000, 3).at(0.5, 400000, 3).at(0.2, 400000).gone()
+check("unchecked: 未檢查即進入, 擅自闖入", (outcome(events()), said),
+      ([("in", "in", "edge", "未檢查即進入")], ["intrusion"]))
+reset()
+Walk(78).at(0.15, 400000, 3).at(0.5, 400000, 3)._pass().at(0.8, 400000).gone()
+check("with a PASS: in, no alarm", (outcome(events()), said), ([("in", "in", "edge", None)], []))
+reset()
+Walk(79).at(0.15, 400000, 3).at(0.5, 400000, 3).at(0.3, 100000).gone()
+check("a small box crossing still does not count", outcome(events()), [("out", "unknown", None, None)])
+gs._state["cfg"]["door_side"] = "right"
+reset()
+
+print("31. exit area (exit_roi): an exit counts only once the feet have been in it (2026-10-09)")
+# The bottom-centre of the box = the feet. Here the area spans y 576-845 of 960; box()
+# puts the feet at 900 (outside) unless told otherwise.
+reset()
+gs._state["cfg"].update(door_side="both", exit_roi=[0.3, 0.6, 0.7, 0.88])
+w = Walk(90).at(0.15, 400000, 3).at(0.5, 400000, 3).shrink(0.5, 400000)
+check("walked away, feet never in the exit area: not out yet", outcome(events()), [])
+check("...the visit is still open", gs._visits[90]["resolved"], False)
+w.at(0.5, 100000, 2, feet=800).gone()
+check("feet in the exit area: out", outcome(events()), [("out", "out", "away", "未檢查即出場")])
+reset()
+w = Walk(91).at(0.15, 400000, 3).at(0.5, 400000, 3).at(0.5, 350000, 2, feet=820)
+w.at(0.5, 350000, 2).shrink(0.5, 350000).gone()      # feet back down, then walks off
+check("feet were in it once, earlier in the visit: out",
+      outcome(events()), [("out", "out", "away", "未檢查即出場")])
+reset()
+Walk(92).at(0.15, 400000, 3).at(0.5, 400000, 3).gone()
+check("out of view, feet never in it: lost, no alarm", (outcome(events()), said),
+      ([("out", "unknown", None, None)], []))
+reset()
+Walk(93).at(0.15, 400000, 3).at(0.5, 300000, 3, feet=800).gone()
+check("out of view after the feet were in it: out", outcome(events()),
+      [("out", "out", "vanish", "未檢查即出場")])
+reset()
+w = Walk(94)
+for f in (0.3, 0.6, 1.0, 1.3):
+    w.at(0.5, f * AREA_TH)
+w.at(0.5, 1.3 * AREA_TH, 3).at(0.2, 1.3 * AREA_TH).gone()
+check("進場 is not affected", outcome(events()), [("in", "in", "edge", "未檢查即進入")])
+reset()
+gs._state["cfg"]["door_side"] = "right"           # one restricted side: leaving by the other
+Walk(95).at(0.85, 400000, 3).at(0.5, 400000, 3).at(0.4, 400000).at(0.3, 400000).gone()
+check("out by the unrestricted side, feet never in it: lost", outcome(events()),
+      [("out", "unknown", None, None)])
+check("a usable rectangle is read back", gs.exit_roi(), [0.3, 0.6, 0.7, 0.88])
+for bad in ([0.5, 0.6, 0.4, 0.8], [0.3, 0.6, 0.7], [-0.1, 0.6, 0.7, 0.8], "x", None):
+    gs._state["cfg"]["exit_roi"] = bad
+    check(f"unusable {bad!r}: off", gs.exit_roi(), None)
+gs._state["cfg"].pop("exit_roi")
 reset()
 
 print("22. the check votes on the dwell's last 3 frames + 2 new ones (2026-10-07)")

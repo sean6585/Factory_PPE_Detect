@@ -124,6 +124,20 @@
   .doorMark.left{left:8px}
   .doorMark.right{right:8px}
   .doorMark.both{left:50%;transform:translateX(-50%);white-space:nowrap}
+  /* The exit area (exit_roi): an exit counts only once a worker's feet have been in it.
+     Positioned over the picture like the door zone; the drawing layer above it catches
+     the drag only while 畫出場區 is armed. */
+  #exitRoi{position:absolute;pointer-events:none;display:none;z-index:2;box-sizing:border-box;
+           border:3px dashed #06b6d4;background:rgba(6,182,212,.10)}
+  #exitRoi.on{display:block}
+  .exitRoiMark{position:absolute;left:4px;top:4px;padding:1px 6px;border-radius:4px;
+               font-size:12px;font-weight:700;color:#fff;background:rgba(8,145,178,.85);
+               white-space:nowrap}
+  #exitRoiLayer{position:absolute;display:none;z-index:4;cursor:crosshair;
+                background:rgba(6,182,212,.06);touch-action:none}
+  #exitRoiLayer.on{display:block}
+  #exitRoiDraw.on{border-color:#06b6d4;color:#0e7490;font-weight:700}
+  #exitRoiClear.arming{border-color:var(--ng);color:var(--ng);font-weight:700}
 
   /* Door-zone bar under the picture: one track, two handles ( ----I--------I---- ).
      Not native <input type=range>: two of those can't share a track without one
@@ -275,6 +289,7 @@
   #verdict{font-weight:800}
   #verdict.pass{color:var(--ok)} #verdict.fail{color:var(--ng)}
   #verdict.idle{color:#b0b0b0}
+  #direction.in{color:#1565c0;font-weight:800} #direction.out{color:#ef6c00;font-weight:800}
   #warn{margin-top:12px;color:#b45309;font-size:15px}
   #err{color:var(--ng);font-size:15px;margin-top:10px}
   #modelBtn, #recordsBtn, #rfidBtn, #rtBtn{font-family:ui-monospace,Menlo,monospace;font-size:13px}

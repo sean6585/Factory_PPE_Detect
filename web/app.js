@@ -46,13 +46,30 @@ function paintArea(){
 
 // 出場 visits (a track that came from the door's side) start at this fraction of the area
 // threshold — a side-on worker stepping out of the door is smaller than a front-on one.
-let EXIT_FRAC = 0.6, AWAY_FRAC = 0.5;
+let EXIT_FRAC = 0.6, AWAY_FRAC = 0.5, VANISH_S = 0.5;
 function paintExitFrac(){
   if (document.activeElement !== $("exitFrac")) $("exitFrac").value = EXIT_FRAC.toFixed(2);
   $("exitFracPx").textContent = `= ${fmtArea(AREA_MIN * EXIT_FRAC)} px²`;
   if (document.activeElement !== $("awayFrac")) $("awayFrac").value = AWAY_FRAC.toFixed(2);
   $("awayFracPx").textContent = `= ${fmtArea(AREA_MIN * AWAY_FRAC)} px²`;
+  if (document.activeElement !== $("vanishSec")) $("vanishSec").value = VANISH_S.toFixed(1);
 }
+// 「消失即出場」: a leaving worker out of view this long inside the zone has gone behind a
+// wall — through, like walking away.
+$("vanishSec").onkeydown = e => { if (e.key === "Enter") $("vanishSec").blur(); };
+$("vanishSec").onchange = async () => {
+  const v = Number($("vanishSec").value);
+  try{
+    if (isNaN(v)) throw new Error("not a number");
+    const r = await fetch("/api/vanish_exit", {method: "POST",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify({seconds: v})});
+    const d = await r.json().catch(() => ({error: `HTTP ${r.status}`}));
+    if (!r.ok || d.error) throw new Error(d.error || `HTTP ${r.status}`);
+    VANISH_S = d.vanish_exit_s;
+    if (CFG) CFG.cfg.vanish_exit_s = VANISH_S;
+  }catch(e){ $("err").textContent = "Could not save 消失即出場: " + e.message; }
+  paintExitFrac();
+};
 // "Walked away" line: a visit's box under this fraction of the area threshold (held
 // 0.3 s) has left — out for 出場, turned back for 進場.
 $("awayFrac").onkeydown = e => { if (e.key === "Enter") $("awayFrac").blur(); };
@@ -190,6 +207,7 @@ function positionZoneOverlay(){
   const ov = $("zoneOverlay");
   const el = pictureEl();
   placeOver($("trackCv"), liveEl());
+  positionExitRoi();
   const [l, r] = ZONE;
   if (!el || !el.offsetWidth || (l <= 0 && r >= 1)){ ov.classList.remove("on"); return; }
   ov.style.left = el.offsetLeft + "px";
@@ -201,10 +219,105 @@ function positionZoneOverlay(){
   $("zoneEdgeL").style.left = (l * 100) + "%";
   $("zoneEdgeR").style.left = (r * 100) + "%";
   $("doorMark").className = "doorMark " + DOOR_SIDE;
-  $("doorMark").textContent = {left: "◀ 門 · 管制區", right: "門 · 管制區 ▶",
-                               both: "◀ 門 · 管制區（左右兩側） ▶"}[DOOR_SIDE] || "門 · 管制區";
+  $("doorMark").textContent = {left: "◀ 管制區", right: "管制區 ▶",
+                               both: "◀ 管制區（左右兩側） ▶"}[DOOR_SIDE] || "管制區";
   ov.classList.add("on");
 }
+
+// ── exit area (exit_roi) ────────────────────────────────────────────────
+// The floor a leaving worker steps onto. When it is set, the gate counts an exit only once
+// the worker's FEET — the bottom-centre of their box — have been in it: judged gone
+// (walked away, out of view) but never stepped out = not out yet. Drawn by dragging on the
+// picture after pressing 畫出場區; stored as fractions of the frame, like the door zone,
+// so it means the same on the live stream, the 1280 frame the gate judges and a result.
+let EXIT_ROI = null;          // [x1, y1, x2, y2] fractions, or null = off
+let ROI_DRAW = null;          // armed: {} before the press, {x0, y0, x1, y1} while dragging
+let ROI_CLEAR_TIMER = null;   // 清除 asks for a second press within 3 s
+
+function roiRect(d){
+  return [Math.min(d.x0, d.x1), Math.min(d.y0, d.y1), Math.max(d.x0, d.x1), Math.max(d.y0, d.y1)];
+}
+
+function positionExitRoi(){
+  const el = pictureEl(), box = $("exitRoi"), layer = $("exitRoiLayer");
+  if (!el || !el.offsetWidth){ box.classList.remove("on"); layer.classList.remove("on"); return; }
+  if (ROI_DRAW){
+    layer.style.left = el.offsetLeft + "px"; layer.style.top = el.offsetTop + "px";
+    layer.style.width = el.offsetWidth + "px"; layer.style.height = el.offsetHeight + "px";
+    layer.classList.add("on");
+  } else layer.classList.remove("on");
+  const r = ROI_DRAW && ROI_DRAW.x0 != null ? roiRect(ROI_DRAW) : EXIT_ROI;
+  if (!r){ box.classList.remove("on"); return; }
+  box.style.left = (el.offsetLeft + r[0] * el.offsetWidth) + "px";
+  box.style.top = (el.offsetTop + r[1] * el.offsetHeight) + "px";
+  box.style.width = ((r[2] - r[0]) * el.offsetWidth) + "px";
+  box.style.height = ((r[3] - r[1]) * el.offsetHeight) + "px";
+  box.classList.add("on");
+}
+
+function paintExitRoiBtns(){
+  $("exitRoiDraw").classList.toggle("on", !!ROI_DRAW);
+  $("exitRoiDraw").textContent = ROI_DRAW ? "在畫面上拖曳框出出場區…（Esc 取消）"
+                               : EXIT_ROI ? "重畫出場區" : "畫出場區";
+  $("exitRoiClear").hidden = !EXIT_ROI || !!ROI_DRAW;
+}
+
+async function saveExitRoi(rect){
+  try{
+    const r = await fetch("/api/exit_roi", {method: "POST",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify({rect})});
+    const d = await r.json().catch(() => ({error: `HTTP ${r.status}`}));
+    if (!r.ok || d.error) throw new Error(d.error || `HTTP ${r.status}`);
+    EXIT_ROI = d.exit_roi;
+    if (CFG) CFG.cfg.exit_roi = EXIT_ROI;
+  }catch(e){ $("err").textContent = "Could not save the exit area: " + e.message; }
+  paintExitRoiBtns(); positionExitRoi();
+}
+
+function stopRoiDraw(){ ROI_DRAW = null; paintExitRoiBtns(); positionExitRoi(); }
+
+$("exitRoiDraw").onclick = () => {
+  if (ROI_DRAW) return stopRoiDraw();                        // pressed again: cancel
+  if (!pictureEl()){ $("err").textContent = "No picture to draw the exit area on yet."; return; }
+  ROI_DRAW = {}; paintExitRoiBtns(); positionExitRoi();
+};
+function roiFrac(e){
+  const b = $("exitRoiLayer").getBoundingClientRect();
+  return [Math.min(1, Math.max(0, (e.clientX - b.left) / b.width)),
+          Math.min(1, Math.max(0, (e.clientY - b.top) / b.height))];
+}
+$("exitRoiLayer").addEventListener("pointerdown", e => {
+  if (!ROI_DRAW) return;
+  e.preventDefault();
+  try { $("exitRoiLayer").setPointerCapture(e.pointerId); } catch (err) {}   // keeps the drag past the edge
+  const [x, y] = roiFrac(e);
+  ROI_DRAW = {x0: x, y0: y, x1: x, y1: y};
+  positionExitRoi();
+});
+$("exitRoiLayer").addEventListener("pointermove", e => {
+  if (!ROI_DRAW || ROI_DRAW.x0 == null) return;
+  [ROI_DRAW.x1, ROI_DRAW.y1] = roiFrac(e);
+  positionExitRoi();
+});
+$("exitRoiLayer").addEventListener("pointerup", e => {
+  if (!ROI_DRAW || ROI_DRAW.x0 == null) return;
+  [ROI_DRAW.x1, ROI_DRAW.y1] = roiFrac(e);
+  const rect = roiRect(ROI_DRAW);
+  ROI_DRAW = null;
+  saveExitRoi(rect);
+});
+document.addEventListener("keydown", e => { if (e.key === "Escape" && ROI_DRAW) stopRoiDraw(); });
+$("exitRoiClear").onclick = () => {
+  const b = $("exitRoiClear");
+  if (!b.classList.contains("arming")){
+    b.classList.add("arming"); b.textContent = "再按一次：清除出場區";
+    ROI_CLEAR_TIMER = setTimeout(() => { b.classList.remove("arming"); b.textContent = "清除"; }, 3000);
+    return;
+  }
+  clearTimeout(ROI_CLEAR_TIMER);
+  b.classList.remove("arming"); b.textContent = "清除";
+  saveExitRoi(null);
+};
 
 // ── walking track ───────────────────────────────────────────────────────
 // The positions the trigger loop already computed, replayed as a floor path with an
@@ -242,7 +355,7 @@ function drawBoxes(g, s, W, H){
   const boxes = (s && s.enabled && s.watching && s.boxes) || [];
   const k = Math.max(1, Math.min(W, H) / 640);
   for (const b of boxes){
-    const [x1, y1, x2, y2, score, area, flag, tid, intent] = b;
+    const [x1, y1, x2, y2, score, area, flag, tid, intent, feetOut] = b;
     const x = x1 * W, y = y1 * H, w = (x2 - x1) * W, h = (y2 - y1) * H;
     g.setLineDash(flag ? [] : [7 * k, 5 * k]);
     g.strokeStyle = flag === 2 ? COL.person : flag === 1 ? COL.ng
@@ -256,7 +369,8 @@ function drawBoxes(g, s, W, H){
       // through is exactly what the 10 Hz loop is being tried for. "#?" = not yet confirmed.
       // 進場 / 出場 appears once the ID reaches the door zone — what the gate has
       // decided this person is doing, read off which side they came from.
-      const label = `#${tid ?? "?"}${intent ? " " + intent : ""}  ${fmtScore(score)}  ${fmtArea(area)}`;
+      const label = `#${tid ?? "?"}${intent ? " " + intent : ""}${feetOut ? " 腳✓" : ""}`
+                  + `  ${fmtScore(score)}  ${fmtArea(area)}`;
       g.font = `${Math.max(10, Math.round(11.5 * k))}px ui-monospace,Menlo,monospace`;
       const tw = g.measureText(label).width + 10, th = 18 * k;
       const ty = y - th >= 0 ? y - th : y;
@@ -267,6 +381,18 @@ function drawBoxes(g, s, W, H){
       g.fillStyle = "#fff";
       g.textBaseline = "middle";
       g.fillText(label, x + 5, ty + th / 2);
+    }
+    if (EXIT_ROI && tid != null){
+      // The feet (bottom-centre) — what the exit area reads: filled when inside it now.
+      const fx = (x1 + x2) / 2, fy = y2;
+      const inside = fx >= EXIT_ROI[0] && fx <= EXIT_ROI[2] && fy >= EXIT_ROI[1] && fy <= EXIT_ROI[3];
+      g.globalAlpha = 1;
+      g.beginPath();
+      g.arc(fx * W, fy * H, 6 * k, 0, 2 * Math.PI);
+      g.lineWidth = Math.max(2, 2.5 * k);
+      g.strokeStyle = "#06b6d4";
+      if (inside){ g.fillStyle = "#06b6d4"; g.fill(); }
+      g.stroke();
     }
     g.globalAlpha = 1;
   }
@@ -471,6 +597,10 @@ function applyThresholdsFromCfg(){
   }
   if (CFG.cfg.exit_area_fraction != null) EXIT_FRAC = Number(CFG.cfg.exit_area_fraction);
   if (CFG.cfg.away_fraction != null) AWAY_FRAC = Number(CFG.cfg.away_fraction);
+  if (CFG.cfg.vanish_exit_s != null) VANISH_S = Number(CFG.cfg.vanish_exit_s);
+  EXIT_ROI = Array.isArray(CFG.cfg.exit_roi) && CFG.cfg.exit_roi.length === 4
+    ? CFG.cfg.exit_roi.map(Number) : null;
+  paintExitRoiBtns(); positionExitRoi();
   paintDwell(CFG.cfg.image_dwell);
   if (CFG.cfg.trigger_min_area != null){
     AREA_MIN = Number(CFG.cfg.trigger_min_area);
@@ -772,7 +902,7 @@ $("doorSide").onchange = async () => {
     const d = await r.json().catch(() => ({error: `HTTP ${r.status}`}));
     if (!r.ok || d.error) throw new Error(d.error || `HTTP ${r.status}`);
     DOOR_SIDE = d.door_side; positionZoneOverlay();
-  }catch(e){ $("err").textContent = "Could not switch the door side: " + e.message; }
+  }catch(e){ $("err").textContent = "Could not switch the restricted-area side: " + e.message; }
   finally{ DOOR_BUSY = false; }
 };
 
@@ -848,6 +978,7 @@ async function pollIT(){
   try{
     const s = await (await fetch("/api/image_trigger")).json();
     if (!IT_TOGGLE_BUSY) paintImageTrigger(s);
+    trackDirection(s);
     paintAlarm(s);
     paintLight(s.light);
     paintDirSource(s);
@@ -1317,6 +1448,7 @@ async function rtTick(){
 function rtShow(d){
   LAST = d;
   PANEL = d;
+  paintDirection();
   renderItems(d);
   $("worker").textContent = "—";
   const v = $("verdict");
@@ -1351,9 +1483,36 @@ function rtShow(d){
 // LAST: LAST is the gate's latest result, and painting it into an idle panel is exactly
 // the stale verdict the operator saw left behind (2026-10-01).
 let PANEL = null;
+
+// 進出場 row: the person at the gate NOW — the image-trigger poll's subject_intent, which
+// is IT's access_type once it answered, else the side the track came from — and, with
+// nobody there, the checked worker's while their result is on the panel. A result's own
+// `intent` is only the track's guess at the verdict and IT may answer otherwise a moment
+// later, so the row follows that worker's box (track_id) in the poll and keeps the last
+// direction it saw (`dir_seen`): a worker IT called 出場 must not flip back to the
+// track's 進場 the moment they walk off.
+const INTENT_LABEL = {in: "進場", out: "出場"};
+let DIR_LIVE = "";
+function trackDirection(s){
+  DIR_LIVE = (s && s.enabled && s.watching && s.subject_intent) || "";
+  const tid = PANEL && PANEL.track_id;
+  if (tid != null && s && s.boxes){
+    const b = s.boxes.find(b => b[7] === tid && b[8]);
+    if (b) PANEL.dir_seen = b[8];
+  }
+  paintDirection();
+}
+function paintDirection(){
+  const t = DIR_LIVE || (PANEL && (PANEL.dir_seen || INTENT_LABEL[PANEL.intent])) || "";
+  const el = $("direction");
+  el.textContent = t || "—";
+  el.className = "val" + (t === "進場" ? " in" : t === "出場" ? " out" : "");
+}
+
 function paintSummary(res){
   if (window.demoResult) window.demoResult(res);     // 大字報 mirrors the panel (demo.js)
   PANEL = res || null;
+  paintDirection();
   renderItems(res);
   const v = $("verdict");
   if (!res){

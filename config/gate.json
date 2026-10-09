@@ -41,8 +41,8 @@
   "trigger_min_area": 190000,
   "rfid_min_rssi": -60.0,
   "trigger_zone": [
-    0.377,
-    0.777
+    0.282,
+    0.661
   ],
   "model": "lite_1006_0008.engine",
   "direction_source": "track",
@@ -50,8 +50,8 @@
   "rfid_rf_mode": 103,
   "door_side": "both",
   "track_person_conf": 0.6,
-  "exit_area_fraction": 1.0,
-  "away_fraction": 0.8,
+  "exit_area_fraction": 0.85,
+  "away_fraction": 0.75,
   "rfid_antenna_settings": {
     "1": {
       "power_dbm": 19.0,
@@ -62,6 +62,13 @@
       "rf_mode": 103
     }
   },
-  "image_dwell": 0.5,
-  "burst_before": 3
+  "image_dwell": 0.3,
+  "burst_before": 3,
+  "vanish_exit_s": 0.5,
+  "exit_roi": [
+    0.2895,
+    0.8396,
+    0.6586,
+    0.9977
+  ]
 }

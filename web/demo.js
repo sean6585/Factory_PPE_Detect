@@ -220,7 +220,7 @@
   }
 
   // The door zone (ROI) as the developer view shows it: shade outside the two edges,
-  // dashed orange edges with a marker on top, and 「門 · 管制區」 on the door's side.
+  // dashed orange edges with a marker on top, and 「管制區」 on the restricted area's side.
   // From the same status (s.zone = gate.json trigger_zone, s.door_side), so moving the
   // edges on the developer page moves them here on the next poll.
   function drawZone(g, s, W, H){
@@ -246,7 +246,7 @@
     g.font = `700 ${Math.round(14 * k)}px "Noto Sans TC","Noto Sans CJK TC",sans-serif`;
     for (const side of sides){
       const left = side === "left";
-      const text = left ? "◀ 門 · 管制區" : "門 · 管制區 ▶";
+      const text = left ? "◀ 管制區" : "管制區 ▶";
       const tw = g.measureText(text).width + 16 * k, th = 24 * k, pad = 8 * k;
       const x = left ? pad : W - pad - tw;
       g.fillStyle = "rgba(185,28,28,.85)";

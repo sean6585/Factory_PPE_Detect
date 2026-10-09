@@ -688,7 +688,8 @@ def _recording_meta() -> dict:
     cfg = _state["cfg"]
     keys = ("model", "person_class", "person_conf", "track_person_conf", "trigger_min_area",
             "trigger_zone", "door_side", "exit_area_fraction", "away_fraction", "image_dwell",
-            "frames", "burst_before", "rfid_min_rssi", "direction_source")
+            "frames", "burst_before", "rfid_min_rssi", "direction_source", "vanish_exit_s",
+            "exit_roi")
     f = latest_frame()
     return {"settings": {k: cfg.get(k) for k in keys}, "items": cfg.get("items"),
             "gate_frame": [f.shape[1], f.shape[0]] if f is not None else None,
@@ -1499,6 +1500,92 @@ def set_away_fraction(frac) -> dict:
     print(f"[config] away_fraction={_state['cfg']['away_fraction']} "
           f"(saved to {_state.get('config_path')})", flush=True)
     return {"away_fraction": _state["cfg"]["away_fraction"]}
+
+
+# A worker leaving who is out of view this long INSIDE the band has walked behind a wall:
+# through, like walking away (operator, 2026-10-09 — the sides are walled stairs, so the
+# way out is either seen shrinking or simply gone). 0.5 s because an exit alarm must not
+# wait (「不能延遲」); the price is that a detector dropout that long reads as an exit too —
+# the same ID coming back reopens the visit (_visit_update). The page's 「消失即出場」.
+# Capped at the tracker's own patience (VISIT_LOST_S): beyond it the ID is gone anyway.
+VANISH_EXIT_DEFAULT = 0.5
+VANISH_EXIT_RANGE = (0.3, 3.5)
+# ...but only while moving AWAY (or standing): a box that grew more than this over its
+# last VANISH_LOOKBACK_S was coming towards the camera — towards the restricted side
+# beside it, where the detector loses people at the dark edge. Recording 20261008_190341
+# #127 came out, turned back and went in on the left, its box 288k → 471k, lost at cx 0.33
+# just inside the band: read as an exit, it was a false 未通過仍出場 (operator: 只有正在
+# 遠離時消失才算). It stays what it was before — "lost", which accuses nobody.
+VANISH_APPROACH_GROWTH = 1.1
+VANISH_LOOKBACK_S = 0.5
+
+
+def vanish_exit_s() -> float:
+    lo, hi = VANISH_EXIT_RANGE
+    try:
+        s = float(_state["cfg"].get("vanish_exit_s", VANISH_EXIT_DEFAULT))
+    except (TypeError, ValueError):
+        s = VANISH_EXIT_DEFAULT
+    return min(max(s, lo), hi)
+
+
+def set_vanish_exit_s(seconds) -> dict:
+    lo, hi = VANISH_EXIT_RANGE
+    try:
+        s = float(seconds)
+    except (TypeError, ValueError):
+        raise ValueError("Seconds must be a number")
+    if not lo <= s <= hi:
+        raise ValueError(f"Seconds must be between {lo:g} and {hi:g}")
+    _state["cfg"]["vanish_exit_s"] = round(s, 2)
+    save_config()
+    print(f"[config] vanish_exit_s={_state['cfg']['vanish_exit_s']} "
+          f"(saved to {_state.get('config_path')})", flush=True)
+    return {"vanish_exit_s": _state["cfg"]["vanish_exit_s"]}
+
+
+# The exit area (the page's 「出場區」, operator 2026-10-09): a rectangle on the picture,
+# [x1, y1, x2, y2] as fractions of the frame. When it is set, an exit only counts once the
+# worker's FEET — the bottom-centre of the box — have been inside it at some point of the
+# visit: judged gone (walked away, out of view) but never actually stepped out = not out
+# yet. Off (None) = no such condition. Only exits read it; entries do not.
+EXIT_ROI_MIN_SIZE = 0.02      # a rectangle thinner than 2 % of the frame is a stray click
+
+
+def exit_roi():
+    """The exit area as [x1, y1, x2, y2] fractions, or None when off or unusable."""
+    r = _state["cfg"].get("exit_roi")
+    try:
+        x1, y1, x2, y2 = (float(v) for v in r)
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1):
+        return None
+    if x2 - x1 < EXIT_ROI_MIN_SIZE or y2 - y1 < EXIT_ROI_MIN_SIZE:
+        return None
+    return [x1, y1, x2, y2]
+
+
+def set_exit_roi(rect) -> dict:
+    """Save the exit area; None clears it."""
+    if rect is None:
+        _state["cfg"]["exit_roi"] = None
+    else:
+        try:
+            r = [round(min(max(float(v), 0.0), 1.0), 4) for v in rect]
+        except (TypeError, ValueError):
+            raise ValueError("The exit area must be four numbers")
+        if len(r) != 4:
+            raise ValueError("The exit area must be four numbers")
+        x1, x2 = sorted(r[0::2])
+        y1, y2 = sorted(r[1::2])
+        if x2 - x1 < EXIT_ROI_MIN_SIZE or y2 - y1 < EXIT_ROI_MIN_SIZE:
+            raise ValueError("The exit area is too small — drag a bigger rectangle")
+        _state["cfg"]["exit_roi"] = [x1, y1, x2, y2]
+    save_config()
+    print(f"[config] exit_roi={_state['cfg']['exit_roi']} "
+          f"(saved to {_state.get('config_path')})", flush=True)
+    return {"exit_roi": _state["cfg"]["exit_roi"]}
 
 
 def exit_area_fraction() -> float:
@@ -2435,7 +2522,8 @@ def _visit_start(v: dict, came_from, now: float, area: float) -> None:
     v.update(engaged=True, resolved=False, started=now,     # started: say_to's "same visit"
              intent="out" if _is_door(came_from) else "in",
              intent_it=None, checks=[], last_activity=now,
-             away_since=None, away_blocked=False, rearm=False, peak=area)
+             away_since=None, away_blocked=False, rearm=False, peak=area,
+             hist=[(now, area)], vanish_skipped=False, feet_out=False, feet_noted=False)
 
 
 def _away_line(v: dict, min_area: float) -> float:
@@ -2473,6 +2561,40 @@ def _away_step(v: dict, area: float, cx: float, small: bool, now: float) -> bool
     return now - v["away_since"] >= AWAY_CONFIRM_S
 
 
+def _feet_in_exit_roi(b, w: int, h: int) -> bool:
+    """Is this box's bottom-centre — the feet — inside the exit area (off = never)?"""
+    r = exit_roi()
+    if r is None:
+        return False
+    fx, fy = (b[0] + b[2]) / 2 / w, b[3] / h
+    return r[0] <= fx <= r[2] and r[1] <= fy <= r[3]
+
+
+def _feet_ok(v: dict) -> bool:
+    """May this visit count as gone OUT? Always, unless an exit area is set and the
+    worker's feet have not been in it yet this visit (exit_roi)."""
+    return exit_roi() is None or bool(v.get("feet_out"))
+
+
+def _not_out_yet(v: dict, how: str) -> None:
+    """Journal, once per visit, an exit held back by the exit area."""
+    if not v.get("feet_noted"):
+        v["feet_noted"] = True
+        print(f"[visit] #{v['tid']} {how}, but the feet never entered the exit area — "
+              f"not out yet", flush=True)
+
+
+def _approaching(v: dict) -> bool:
+    """Did this visit's box grow by more than VANISH_APPROACH_GROWTH over its last
+    VANISH_LOOKBACK_S of sightings — coming towards the camera, not going behind a wall?"""
+    h = v.get("hist") or []
+    if len(h) < 2:
+        return False
+    t_last, a_last = h[-1]
+    a_then = next(a for t, a in h if t >= t_last - VANISH_LOOKBACK_S)
+    return a_last > VANISH_APPROACH_GROWTH * a_then
+
+
 def _visit_update(persons: list[dict], min_area: float, zone, now: float, frame) -> None:
     """Advance every tracked person by one tick; resolve visits that just ended."""
     w = frame.shape[1]
@@ -2490,6 +2612,20 @@ def _visit_update(persons: list[dict], min_area: float, zone, now: float, frame)
         cx = (d["box"][0] + d["box"][2]) / 2 / w
         side = _side(cx, zone)
         prev = v["side"]
+        if v.get("vanished") is not None:
+            # Back after a vanish exit (below): the detector lost them, they did not go
+            # behind a wall. The visit goes on where it was, with its checks — a PASS must
+            # not be lost, or walking off later would be a second, false 未檢查即出場. Those
+            # checks already left with the vanish exit's events.jsonl line; the copies kept
+            # here are marked sent so the outbox never posts them twice (copies, because
+            # that line may still be waiting in _rec_q). The exit already announced stays
+            # on record — the price of not waiting (operator, 2026-10-09: 不能延遲).
+            print(f"[visit] #{tid} back {now - v['vanished']:.1f} s after its vanish exit — "
+                  f"a dropout: the visit goes on", flush=True)
+            v.update(resolved=False, vanished=None, gone_at=None,
+                     checks=[dict(c, it={"state": "sent"}) for c in v["checks"]])
+            v["prev_area"], v["prev_cx"] = _area(d["box"]), cx   # no "jump" across the gap
+        v["vanish_skipped"] = False      # in view: the next vanish is judged afresh
         if v.get("gone_at") is not None:
             # Back after vanishing mid-visit (see below): where, and after how long.
             print(f"[visit] #{tid} back in view after {now - v['gone_at']:.1f} s at "
@@ -2502,29 +2638,26 @@ def _visit_update(persons: list[dict], min_area: float, zone, now: float, frame)
         v["score"] = d.get("score", 0.0)
         v["box"] = list(d["box"])
         # Where this track last came from, kept across ticks — not just the tick before
-        # the band: a side-on worker out of the door may only grow past the exit bar a
-        # few ticks INSIDE the band. Small in the middle of the frame = far down the
-        # entrance path, which wipes it: whoever walks up from there is coming in.
-        # Out of the DOOR counts only for a box already at the exit bar (exit_area_fraction
-        # × AREA_TH) there, on a track never smaller than that before (operator,
-        # 2026-10-09: 「面積也要大於門檻」). The door is at the camera, so a worker stepping
-        # out of it is big from the first sighting; someone walking up the hall along that
-        # side starts small — the 2026-10-08 recording's #240, 100k against a 190k AREA_TH,
-        # read as leaving once the zone edge moved in. A door-side sighting that does not
-        # qualify leaves the origin as it was. The bar here stops at AREA_TH: a multiplier
-        # above 1 raises when a worker from the door is followed and checked (_gate_area),
-        # and must not turn a door-side worker under it into one walking in — who would
-        # then be checked sooner, at the plain AREA_TH, not later.
-        door_min = min_area * min(1.0, exit_area_fraction())
+        # the band: a side-on worker out of the restricted side may only grow past the
+        # exit bar a few ticks INSIDE the band. Any sighting on a side counts, whatever its
+        # size (operator, 2026-10-09): the sides are walled stairs up to the ceiling, so
+        # whoever is there is right beside the camera — often half in frame, a small box
+        # cut off by the image edge. The area bar that stood here that morning read three
+        # of seven exits in recording 20261009_143959 as 進場 (#394/#401/#405, 120-135k).
+        # Only the band holds people far away, which is why its edges must take in the
+        # whole hallway. Small in the middle of the frame = far down the entrance path,
+        # which wipes the origin: whoever walks up from there is coming in.
         if side != "B":
-            if not _is_door(side) or (area >= door_min and not v.get("was_small")):
-                v["came_from"] = side
+            v["came_from"] = side
         elif area < CROSS_MIN_AREA_FRACTION * min_area:
             v["came_from"] = None
-        if area < door_min:
-            v["was_small"] = True
+        feet_in = _feet_in_exit_roi(d["box"], w, frame.shape[0])
         if v["engaged"] and not v["resolved"]:
             v["peak"] = max(v.get("peak") or 0.0, area)
+            v["feet_out"] = v.get("feet_out") or feet_in   # stepped out at least once
+            v["frame"] = frame       # the last sight of them: a vanish exit's photo (below)
+            v["hist"] = [h for h in v.get("hist", []) if now - h[0] <= 2 * VANISH_LOOKBACK_S]
+            v["hist"].append((now, area))     # coming or going, when they vanish (below)
         small = area < (_away_line(v, min_area) if v["engaged"]
                         else CROSS_MIN_AREA_FRACTION * min_area)
         # Big enough to be at the gate: AREA_TH, or exit_area_fraction of it for a track
@@ -2539,18 +2672,33 @@ def _visit_update(persons: list[dict], min_area: float, zone, now: float, frame)
                         or (v["resolved"] and (prev != "B" or v.get("rearm")))):
             _visit_start(v, v.get("came_from"), now, area)   # first arrival, or another go
             v["prev_area"], v["prev_cx"] = area, cx
+            v["frame"] = frame       # a vanish on the very next tick still has its photo
+            v["feet_out"] = feet_in
         elif v["engaged"] and not v["resolved"]:
             intent = v.get("intent_it") or v["intent"]       # IT's answer wins
             away_how = "through" if intent == "out" else "back"
-            if _away_step(v, area, cx, small, now):
+            # An exit waits for the feet to have been in the exit area (exit_roi, when
+            # set): gone by the walk-away line but never stepped out = not out yet.
+            may_go = intent != "out" or _feet_ok(v)
+            gone = _away_step(v, area, cx, small, now)
+            if gone and may_go:
                 # Walked away from the camera: the way out of the plant on this site, and
                 # an entering worker giving up.
                 _visit_resolve(v, away_how, frame, box=d["box"], via="away")
             elif prev == "B" and side != "B":
-                went_through = _is_door(side) == (intent == "in")
-                if small and v.get("away_since") is not None:
+                # Into a restricted side = in, whoever it is: a worker who has just come out
+                # and goes straight back in too (operator, 2026-10-09: 從ROI跨到左右兩側管制區
+                # 就算進入 — 算進場). Out by a side that is not restricted (door_side left or
+                # right only): out for 出場, back for 進場.
+                entered = _is_door(side)
+                went_through = entered or intent == "out"
+                if small and v.get("away_since") is not None and may_go:
                     # Already walking away, and drifted out of the band on the way.
                     _visit_resolve(v, away_how, frame, box=d["box"], via="away")
+                elif not entered and intent == "out" and not may_go:
+                    # Out by the unrestricted side without the feet ever in the exit area.
+                    _not_out_yet(v, "left by the unrestricted side")
+                    _visit_resolve(v, "lost", None)
                 elif went_through and small:
                     # Only a box that is still near the gate can walk through it. A small
                     # one crossing the edge is someone in the background — usually the
@@ -2562,10 +2710,15 @@ def _visit_update(persons: list[dict], min_area: float, zone, now: float, frame)
                           f"walking through", flush=True)
                     _visit_resolve(v, "lost", None)
                 else:
+                    if entered and intent == "out":
+                        v["intent"], v["intent_it"] = "in", None   # came out, went back in
                     _visit_resolve(v, "through" if went_through else "back", frame,
                                    box=d["box"])
+            elif gone:
+                _not_out_yet(v, "walked away")        # held back by the exit area
         v["side"] = side
         d["intent"] = (v.get("intent_it") or v["intent"]) if v["engaged"] else None
+        d["feet_out"] = bool(v["engaged"] and v.get("feet_out"))    # live view: 「腳✓」
     for tid, v in list(_visits.items()):
         if tid in seen:
             # Standing still after a check, with no re-check coming: did not go through.
@@ -2573,6 +2726,22 @@ def _visit_update(persons: list[dict], min_area: float, zone, now: float, frame)
                     and now - v["last_activity"] >= VISIT_IDLE_S):
                 _visit_resolve(v, "stayed", None)
             continue
+        # Leaving, and out of view while inside the band: walked behind a wall — through,
+        # like walking away (operator, 2026-10-09). A 進場 visit that vanishes is still
+        # "lost" below; one that vanished on a side has crossed into it already.
+        if (v["engaged"] and not v["resolved"] and v.get("side") == "B"
+                and (v.get("intent_it") or v["intent"]) == "out"
+                and now - v["last_t"] >= vanish_exit_s() and not v.get("vanish_skipped")):
+            if _approaching(v):
+                v["vanish_skipped"] = True
+                print(f"[visit] #{tid} out of view while coming towards the camera "
+                      f"(cx {v.get('cx', -1):.2f}) — not read as gone behind a wall", flush=True)
+            elif not _feet_ok(v):
+                v["vanish_skipped"] = True
+                _not_out_yet(v, "out of view")
+            else:
+                v["vanished"] = now
+                _visit_resolve(v, "through", v.get("frame"), box=v.get("box"), via="vanish")
         # Diagnostics: a visitor still mid-visit who has not been detected for 0.5 s. When a
         # walk-in is missed, this line says whether they vanished BEFORE crossing the band's
         # edge (too close to the camera, half out of frame) — the case seen 2026-09-30.
@@ -2659,8 +2828,9 @@ def _visit_resolve(v: dict, how: str, frame, box=None, via: str = "edge") -> Non
 
     how: "through" (left by the far edge), "back" (by the edge it came from), "stayed"
     (checked, never left, VISIT_IDLE_S passed), "lost" (the ID vanished mid-visit).
-    via: "edge" (crossed a band edge) or "away" (walked away from the camera; through
-    for 出場, back for 進場) — kept on the event so a wrong call can be traced.
+    via: "edge" (crossed a band edge), "away" (walked away from the camera; through
+    for 出場, back for 進場) or "vanish" (出場 out of view inside the band — behind a wall)
+    — kept on the event so a wrong call can be traced.
 
     Always an events.jsonl line — the audit of every in/out decision and the IT outbox,
     with it_report saying which lines go to IT. A worker who went THROUGH without a PASS
@@ -2668,6 +2838,7 @@ def _visit_resolve(v: dict, how: str, frame, box=None, via: str = "edge") -> Non
     carrying the frame of that moment. Nothing here is ever spoken.
     """
     v["resolved"] = True
+    v.pop("frame", None)         # a whole frame per visit: kept only while it is open
     if via == "away":
         # Walked away from the camera: whatever side this track came from no longer says
         # anything about it. Kept, a worker who came out of the door, walked off far enough
@@ -2676,6 +2847,11 @@ def _visit_resolve(v: dict, how: str, frame, box=None, via: str = "edge") -> Non
         # (returning where they came from) and the intrusion went unreported (2026-10-08
         # recording, #242). Cleared, the way back is a new 進場 visit.
         v["came_from"] = None
+        # Gone, so coming back up is a new visit — even straight away. Re-arming waited
+        # for a box under the line on a LATER tick; a worker confirmed gone on the tick
+        # they turned never gave one, and their way back in went unjudged (recording
+        # 20261009_143959, #394).
+        v["rearm"] = True
     intent = v.get("intent_it") or v["intent"]       # IT's access_type, when it answered
     last = v["checks"][-1] if v["checks"] else None
     # The worker whose PASS window is open has now left the band one way or the other:
@@ -2764,6 +2940,8 @@ def _visit_resolve(v: dict, how: str, frame, box=None, via: str = "edge") -> Non
              if box is not None and frame is not None else "")
     if how in ("through", "back") and via == "away":
         where = "  (walked away)" + where
+    elif how == "through" and via == "vanish":
+        where = "  (out of view in the band)" + where
     print(f"[visit] #{v['tid']} {INTENT_TEXT[intent]} → {departure}{where}"
           f"{'  ppe=' + ev['ppe'] if ev['ppe'] else ''}"
           f"{'  VIOLATION ' + violation if violation else ''}"
@@ -2916,7 +3094,9 @@ def image_trigger_loop() -> None:
                  # AREA_TH but in a visit (a side-on worker out of the door)
                  2 if d is subject and in_zone else (1 if d in people_in
                                                      else 3 if d.get("intent") else 0),
-                 d.get("tid"), INTENT_TEXT.get(d.get("intent"), "")]
+                 d.get("tid"), INTENT_TEXT.get(d.get("intent"), ""),
+                 # 1 = this visit's feet have been in the exit area (exit_roi)
+                 int(bool(d.get("feet_out")))]
                 for d in persons]
             # The checklist's own item boxes (helmet, harness…) from this same tick, for the
             # live overlay: the result picture no longer freezes, so this is where the
@@ -3875,6 +4055,26 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as e:
                 return self._err(400, str(e))
 
+        if u.path == "/api/vanish_exit":
+            try:
+                req = json.loads(body)
+            except Exception:
+                return self._err(400, "Body must be JSON")
+            try:
+                return self._json(set_vanish_exit_s(req.get("seconds")))
+            except ValueError as e:
+                return self._err(400, str(e))
+
+        if u.path == "/api/exit_roi":
+            try:
+                req = json.loads(body)
+            except Exception:
+                return self._err(400, "Body must be JSON")
+            try:
+                return self._json(set_exit_roi(req.get("rect")))
+            except ValueError as e:
+                return self._err(400, str(e))
+
         if u.path == "/api/exit_area_fraction":
             try:
                 req = json.loads(body)
@@ -4404,6 +4604,7 @@ def main():
     cfg.setdefault("track_person_conf", TRACK_PERSON_CONF_DEFAULT)
     cfg.setdefault("exit_area_fraction", EXIT_AREA_FRACTION_DEFAULT)
     cfg.setdefault("away_fraction", AWAY_FRACTION_DEFAULT)
+    cfg.setdefault("vanish_exit_s", VANISH_EXIT_DEFAULT)
     cfg.setdefault("burst_before", BURST_BEFORE_DEFAULT)
     cfg["image_dwell"] = _dwell_from(cfg, args.image_dwell)   # so the page can show it
 

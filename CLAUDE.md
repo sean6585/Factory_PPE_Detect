@@ -46,7 +46,7 @@ run_gate_native.sh   preflight (torch/torchvision ABI, CUDA) → picks .engine o
 | What | Where | Notes |
 |---|---|---|
 | Checklist: items, class mappings, thresholds | `config/gate.json` | **written at runtime by the UI** |
-| Image-trigger area (px²) + RFID one-person RSSI floor (dBm) + RFID transmit power / receive mode per antenna + door side of the image + tracking person score + exit area fraction + walk-away line | `config/gate.json` (`trigger_min_area`, `rfid_min_rssi`, `rfid_antenna_settings` — `{"1": {"power_dbm", "rf_mode"}, …}`, with `rfid_power_dbm` / `rfid_rf_mode` kept as antenna 1's and as the fallback, `door_side`, `track_person_conf`, `exit_area_fraction`, `away_fraction`, `image_dwell` — the page's 「停留」 seconds, 0.3–5, wins over `--image-dwell` like `model` does; `burst_before` — how many of the check's `frames` come from the dwell, default 3, hand-edited) | same file, same UI-written caveat; defaults live in `gate_server.py`, not `DEFAULT_CONFIG` |
+| Image-trigger area (px²) + RFID one-person RSSI floor (dBm) + RFID transmit power / receive mode per antenna + door side of the image + tracking person score + exit area fraction + walk-away line | `config/gate.json` (`trigger_min_area`, `rfid_min_rssi`, `rfid_antenna_settings` — `{"1": {"power_dbm", "rf_mode"}, …}`, with `rfid_power_dbm` / `rfid_rf_mode` kept as antenna 1's and as the fallback, `door_side`, `track_person_conf`, `exit_area_fraction`, `away_fraction`, `vanish_exit_s` — the page's 「消失即出場」 seconds, `exit_roi` — the 「出場區」 rectangle [x1, y1, x2, y2] as frame fractions, null = off, `image_dwell` — the page's 「停留」 seconds, 0.3–5, wins over `--image-dwell` like `model` does; `burst_before` — how many of the check's `frames` come from the dwell, default 3, hand-edited) | same file, same UI-written caveat; defaults live in `gate_server.py`, not `DEFAULT_CONFIG` |
 | Trigger on/off (image, sensor) | `_state` only | resets on restart: image ON, sensor OFF |
 | Camera RTSP URL + password | `config/camera.local.json` | gitignored, never commit |
 | Tower web login (for speaker volume) | `config/tower.local.json` (`web_user`, `web_pass`) | same rule as the camera file: never commit, never echo. The volume itself lives on the tower (0-15), set from the Speaker test slider through its web UI — one web login at a time, so a browser logged into the tower blocks it. The unit's **Mute** box (same page, 「靜音」 checkbox in the popup) silences every voice while `/api/status` still reports the channel playing — the gate cannot see it; check it first when the speaker is silent (2026-10-03) |
@@ -214,20 +214,56 @@ empties See Records. Add columns; don't reorder or rename them.
       anything else incl. appearing in the band → 進場. It goes on the check's
       `captures.csv` row (`direction`) and the live overlay. Which side of the IMAGE
       the door is on is `gate.json` `door_side` (`left` default / `right`), the kiosk's
-      「門在畫面」 select under the picture, marked 「門 · 管制區」 on the live view. The
+      「管制區在畫面」 select under the picture, marked 「管制區」 on the live view. ("Door"
+      in the code — `door_side`, `_is_door` — means that restricted side; on site it is
+      not a door, see 「左 & 右」 below.) The
       site plan (door left of the check area, camera facing the worker) puts it on the
       image's right — but the operator turned the camera's **mirror** on, so on the live
       gate it is **left** (set 2026-10-02). Mirroring flips only left/right; walking
       towards / away from the camera is unaffected. Confirm on site by watching a worker
-      walk to the door. **「左 & 右」 (`both`, 2026-10-09)**: the door is at the camera's end
-      and the band's two sides are its walls — out of either side is 出場, leaving by
-      either side is going in (`_is_door`).
-    - **Out of the door = big at first sight** (2026-10-09): a door-side sighting counts as
-      coming out of the door only when the box is already ≥ min(1, `exit_area_fraction`) ×
-      AREA_TH there and the track was never smaller than that before (`was_small`) — the
-      door is at the camera, someone walking up the hall along that side starts small
-      (2026-10-08 recording #240). Same knob as below; above 1 it only raises the check bar.
-    - **Side-on exits** (2026-10-03, `exit_area_fraction`, default 0.6, the 「出場（門那側來）×」
+      walk to the door. **「左 & 右」 (`both`, 2026-10-09)**: the restricted area is on both
+      sides of the band, next to the camera — on site the stairs up to the ceiling, left
+      and right (operator 2026-10-09: 左右兩邊不是門，是管制區). Out of either side is 出場,
+      leaving by either side is going in (`_is_door`).
+    - **The operator's in/out rules** (2026-10-09 afternoon, 「我們不要這麼複雜」 — position,
+      not area guesses): the sides are walled, so nobody there is ever far away; only the
+      band holds people walking up from far, and someone behind a wall is simply not seen.
+      **The band's edges must take in the whole hallway** — the rules below assume a side
+      region shows only the restricted area beside the camera.
+      - From a side into the band = 出場, **whatever the box size** (a worker stepping out is
+        often half in frame, a small box cut by the image edge: recording 20261009_143959
+        #394/#401/#405 at 120-135k read as 進場 under the morning's area bar / `was_small`,
+        both removed). First seen in the band = 進場.
+      - 出場 done: walked away (below the 走遠線, as before) OR **out of view inside the band
+        for `vanish_exit_s`** (gate.json, the page's 「消失即出場」, default 0.5 s, 0.3–3.5 —
+        「不能延遲」), `via: "vanish"`, photo = the last frame they were seen in. Only while
+        moving away or standing: a box that grew > 10 % over its last 0.5 s was coming
+        towards the camera — into the restricted side, lost at the dark edge (20261008_190341
+        #127, a false 未通過仍出場 otherwise) — and stays "lost". A dropout that long reads as
+        an exit too (accepted); the same ID coming back within VISIT_LOST_S reopens the visit
+        with its checks, copies marked `it.state: sent` so IT never gets them twice.
+      - 進場 done: from the band into a restricted side — **also for someone who just came
+        out** (was 折返, now 進場 → 擅自闖入 without a PASS; operator: 算進場). The small-box
+        guard below still applies.
+      - A walk-away exit re-arms at once (`rearm`): #394 was confirmed gone on the tick it
+        turned, never under the line again, and its walk back in went unjudged.
+      - **Exit area** (`exit_roi`, the page's 「畫出場區」 under the picture — drag a rectangle,
+        「清除」 takes a second press; 2026-10-09): when set, every way of going OUT (walked
+        away, out of view, the unrestricted side) also needs the worker's FEET — the
+        bottom-centre of the box — to have been inside it at some point of the visit
+        (`feet_out`); judged gone without that = not out yet (journal: "feet never entered
+        the exit area"), and a vanish then ends "lost". Entries are not affected; unset =
+        no condition. The live view marks each tracked person's feet (filled dot = inside)
+        and adds 「腳✓」 to the label once a visit's feet have been in it. Replayed with a
+        trial area [0.25, 0.70, 0.75, 0.92]: 10-08 #245 (a crouch read as walking away —
+        box 404k → 99k, feet stuck at y2 ~955) is no longer an exit; #145's real exit
+        (feet up to y2 783) still is; #198 (walked ~2 m, then hidden by others, feet never
+        off the bottom edge) became "lost". **At home it cannot work**: the bedroom is so
+        shallow the feet never rise above y2 ~939 of 960 — leave it unset there.
+      Replayed on all five recordings: the newest one's seven trips now read right; in the
+      10-08 ones #145 (out of the left, walked away) became 出場 and #198 (walked off, hidden
+      behind other workers) a vanish exit, both confirmed on the video; nothing else moved.
+    - **Side-on exits** (2026-10-03, `exit_area_fraction`, default 0.6, the 「出場（管制區那側來）×」
       box next to the area threshold): a track that came from the door's side starts its
       出場 visit at that fraction of AREA_TH — a worker stepping out of the door is
       side-on (~55-65 % of a front-on box) and never reached AREA_TH, so walking out
@@ -266,7 +302,7 @@ empties See Records. Add columns; don't reorder or rename them.
       does not trigger it — the threshold is relative to AREA_TH, not the worker's own
       size. A resolved visit whose box went small re-arms (`rearm`), so walking up again
       is a new visit. Covered by `scripts/test_visits.py`.
-    - **Departure** is the edge it leaves the band by (or walking away, above); it runs on every tick, cooldown
+    - **Departure** is the edge it leaves the band by (or walking away / out of view, above); it runs on every tick, cooldown
       included, which is what catches a tailgater. Going through without a PASS as the
       latest result is a **violation** (未檢查即進入 / 未通過仍進入 / 被拒絕仍進入 and the
       出場 forms): a VIOLATION row with the frame of that moment, a red flash, the kiosk
