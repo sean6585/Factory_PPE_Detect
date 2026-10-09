@@ -187,11 +187,18 @@ reset()
 Walk(15).at(0.15, 200000, 3).at(0.5, 200000, 3).shrink(0.5, 200000).gone()
 check("no visit", outcome(events()), [])
 
-print("14. out of the door, crosses into the band small and only grows past the bar there")
+print("14. out of the door AT the exit bar, smaller in the band, grows past the bar there")
+# Since 2026-10-09 the door-side sighting itself must reach the bar (0.6 × 300k = 180k
+# here): 「面積也要大於門檻」. What it does in the band afterwards is as before.
 reset()
-Walk(16).at(0.85, 160000, 3).at(0.6, 160000).at(0.55, 190000).at(0.5, 220000, 3) \
+Walk(16).at(0.85, 190000, 3).at(0.6, 160000).at(0.55, 190000).at(0.5, 220000, 3) \
     .shrink(0.5, 220000).gone()
 check("still 出場", outcome(events()), [("out", "out", "away", "未檢查即出場")])
+reset()
+Walk(18).at(0.85, 160000, 3).at(0.6, 160000).at(0.55, 190000).at(0.5, 320000, 3) \
+    .shrink(0.5, 320000).gone()
+check("under the bar on the door side: not out of the door (進場, walked off = back)",
+      outcome(events()), [("in", "back", "away", None)])
 
 print("15. far away in the middle wipes the door origin: walking up from there is 進場")
 reset()
@@ -271,6 +278,146 @@ for (mode, intent), key in want.items():
     gs.announce({"status": "PASS", "source": "image", "intent": intent, "items": []})
     check(f"{mode} mode, {intent}: says", said, [key])
 gs._state["cfg"].pop("direction_source")
+
+print("21. same words to the same person within 5 s are spoken once (2026-10-07)")
+reset()
+gs._voice_said.clear()
+gs._visits[7] = {"tid": 7, "started": 100.0}
+gs._visits[8] = {"tid": 8, "started": 101.0}
+T0 = 1000.0
+check("first ID讀取失敗: spoken", gs.say_to("no_tag", 7, now=T0), True)
+check("again 2 s later, same person: silent", gs.say_to("no_tag", 7, now=T0 + 2.0), False)
+check("again 4.9 s later: still silent", gs.say_to("no_tag", 7, now=T0 + 4.9), False)
+check("someone else, same words: spoken", gs.say_to("no_tag", 8, now=T0 + 2.0), True)
+check("same person, different words: spoken", gs.say_to("fail", 7, now=T0 + 3.0), True)
+check("5 s after it was last SPOKEN: spoken again", gs.say_to("no_tag", 7, now=T0 + 5.1), True)
+gs._visits[7]["started"] = 200.0            # walked off and came back: a new visit
+check("same track ID, new visit: spoken", gs.say_to("no_tag", 7, now=T0 + 6.0), True)
+check("violations are never held back (1)", gs.say_to("intrusion", 7, now=T0 + 6.1), True)
+check("violations are never held back (2)", gs.say_to("intrusion", 7, now=T0 + 6.2), True)
+check("no track ID (button / sensor): always (1)", gs.say_to("no_tag", None, now=T0 + 6.3), True)
+check("no track ID (button / sensor): always (2)", gs.say_to("no_tag", None, now=T0 + 6.4), True)
+check("what was actually said", said,
+      ["no_tag", "no_tag", "fail", "no_tag", "no_tag", "intrusion", "intrusion", "no_tag", "no_tag"])
+reset()
+gs._voice_said.clear()
+gs.announce({"status": "FAIL", "source": "image", "track_id": 8, "items": []})
+gs.announce({"status": "FAIL", "source": "image", "track_id": 8, "items": []})
+check("a FAIL verdict repeated to the same visit: said once", said, ["fail"])
+gs._visits.pop(7, None); gs._visits.pop(8, None)
+
+print("23. exit multiplier above 1: someone from the door must be BIGGER to count (2026-10-09)")
+reset()
+gs._state["cfg"]["exit_area_fraction"] = 1.5                 # door side needs 450k here
+Walk(41).at(0.85, 400000, 3).at(0.5, 400000, 3).shrink(0.5, 400000).gone()
+check("door side at 1.33 × AREA_TH: not followed", outcome(events()), [])
+Walk(42).at(0.85, 500000, 3).at(0.5, 500000, 3).shrink(0.5, 500000, ticks=22).gone()   # long enough under the line
+check("door side at 1.67 × AREA_TH: caught", outcome(events()), [("out", "out", "away", "未檢查即出場")])
+Walk(43).at(0.15, 350000, 3).at(0.5, 350000, 3)
+check("entering keeps the plain AREA_TH (visit started)", gs._visits[43].get("engaged"), True)
+Walk(44).at(0.85, 500000, 2).at(0.5, 500000, 1)
+check("check bar for a door-side track: 1.5 × AREA_TH", gs._gate_area({"tid": 44}, AREA_TH), 1.5 * AREA_TH)
+check("check bar for an entering track: AREA_TH", gs._gate_area({"tid": 43}, AREA_TH), AREA_TH)
+check("check bar for an unknown track: AREA_TH", gs._gate_area({"tid": 999}, AREA_TH), AREA_TH)
+gs._state["cfg"]["exit_area_fraction"] = 0.85
+check("below 1 the check bar stays AREA_TH (only the visit starts early)",
+      gs._gate_area({"tid": 44}, AREA_TH), AREA_TH)
+gs._state["cfg"]["exit_area_fraction"] = 2.5
+check("capped at 2.0", gs.exit_area_fraction(), 2.0)
+gs._state["cfg"].pop("exit_area_fraction")
+reset()
+
+print("24. out of the door, walks off far enough to count as gone, comes back IN (2026-10-08 #242)")
+# The recording's numbers: walk-away line 0.8 × AREA_TH; the worker got down to ~0.57 ×
+# (109k of 190k) — gone by the line, yet above the 0.5 × that used to wipe "came from".
+reset()
+gs._state["cfg"]["away_fraction"] = 0.8
+w = Walk(51).at(0.85, 1.9 * AREA_TH, 3).at(0.5, 1.9 * AREA_TH, 2)     # out of the door (right)
+for f in (1.6, 1.3, 1.1, 0.95, 0.8, 0.7, 0.62, 0.58, 0.57, 0.57, 0.57, 0.57, 0.57):
+    w.at(0.5, f * AREA_TH)                                             # walks away
+check("first visit: 出場 through, walking away", outcome(events()), [("out", "out", "away", "未檢查即出場")])
+check("where it came from is forgotten", gs._visits[51].get("came_from"), None)
+for f in (0.6, 0.7, 0.85, 1.0, 1.2, 1.5, 1.8):                         # turns, walks back up
+    w.at(0.5, f * AREA_TH)
+w.at(0.5, 1.8 * AREA_TH, 3).at(0.7, 1.8 * AREA_TH).at(0.85, 1.8 * AREA_TH).gone()   # into the door
+check("way back is 進場, the door crossing an intrusion",
+      outcome(events()), [("in", "in", "edge", "未檢查即進入")])
+gs._state["cfg"].pop("away_fraction")
+reset()
+
+print("25. door on BOTH sides (左 & 右): out of either side, in through either side (2026-10-09)")
+reset()
+gs._state["cfg"].update(door_side="both", exit_area_fraction=1.0)
+BIG = 1.6 * AREA_TH
+Walk(61).at(0.15, BIG, 3).at(0.5, BIG, 3).shrink(0.5, BIG, ticks=22).gone()
+check("out of the LEFT, walks away: 出場", outcome(events()), [("out", "out", "away", "未檢查即出場")])
+Walk(62).at(0.85, BIG, 3).at(0.5, BIG, 3).shrink(0.5, BIG, ticks=22).gone()
+check("out of the RIGHT, walks away: 出場", outcome(events()), [("out", "out", "away", "未檢查即出場")])
+def walk_up(tid):
+    w = Walk(tid)
+    for f in (0.2, 0.35, 0.5, 0.7, 0.9, 1.1, 1.3, 1.5):
+        w.at(0.5, f * AREA_TH)                       # up the entrance path, straight ahead
+    return w
+walk_up(63).at(0.5, BIG, 3).at(0.2, BIG).gone()
+check("walks up, in through the LEFT: 進場 through", outcome(events()), [("in", "in", "edge", "未檢查即進入")])
+walk_up(64).at(0.5, BIG, 3).at(0.8, BIG).gone()
+check("walks up, in through the RIGHT: 進場 through", outcome(events()), [("in", "in", "edge", "未檢查即進入")])
+w = Walk(65)
+for f in (0.3, 0.5, 0.8, 1.1, 1.4):
+    w.at(0.85, f * AREA_TH)                          # up the hall along the right, small first
+w.at(0.5, BIG, 3).at(0.2, BIG).gone()
+check("along the right from far away: 進場, not out of the door",
+      outcome(events()), [("in", "in", "edge", "未檢查即進入")])
+Walk(66).at(0.15, BIG, 3).at(0.5, BIG, 3).at(0.85, BIG).gone()
+check("out of the left, back in on the right: 出場 → back", outcome(events()), [("out", "back", "edge", None)])
+gs._state["cfg"].pop("exit_area_fraction"); gs._state["cfg"]["door_side"] = "right"
+reset()
+
+print("22. the check votes on the dwell's last 3 frames + 2 new ones (2026-10-07)")
+_saved = {k: getattr(gs, k) for k in ("latest_frame", "detect", "finalize_check", "queue_record")}
+voted = {}
+fresh_detects = []
+gs.latest_frame = lambda: FRAME.copy()
+gs.detect = lambda f: (fresh_detects.append(1) or [{"name": "fresh", "score": 1.0, "box": [0, 0, 1, 1]}], 1.0)
+gs.finalize_check = lambda ids, worker, **k: (voted.__setitem__("dets", [gs._frames[i]["dets"][0]["name"] for i in ids])
+                                             or {"status": "PASS", "items": []})
+gs.queue_record = lambda *a, **k: None
+gs._state.update(camera=True, swapping=False, burst_interval=0.0)
+gs._camera["ok"] = True
+gs._state["cfg"]["frames"] = 5
+def pre(n, tid=4, t0=50.0):
+    return [{"t": t0 + 0.1 * i, "f": FRAME, "tid": tid,
+             "dets": [{"name": f"dwell{i}", "score": 1.0, "box": [0, 0, 1, 1]}]} for i in range(n)]
+try:
+    gs.run_gate_check("", source="image", rfid={"epc": "E", "rssi": -50, "reads": 3, "candidates": []},
+                      pre=pre(3))
+    check("3 kept + 2 new, kept ones first", voted["dets"], ["dwell0", "dwell1", "dwell2", "fresh", "fresh"])
+    check("only 2 new frames were detected", len(fresh_detects), 2)
+    fresh_detects.clear()
+    gs.run_gate_check("", source="image", rfid={"epc": "E", "rssi": -50, "reads": 3, "candidates": []},
+                      pre=pre(6))
+    check("never all 5 from the dwell: the newest 4 + 1 new",
+          voted["dets"], ["dwell2", "dwell3", "dwell4", "dwell5", "fresh"])
+    fresh_detects.clear()
+    gs.run_gate_check("", source="api")
+    check("button / sensor (no dwell): 5 new, as before", (voted["dets"], len(fresh_detects)), (["fresh"] * 5, 5))
+    # Which dwell ticks are taken: same worker, recent, newest last.
+    gs._pre_burst.clear()
+    for e in pre(2, tid=9, t0=99.0) + pre(5, tid=4, t0=99.5):
+        gs._pre_burst.append(e)
+    picked = gs._pre_frames(4, 100.0)
+    check("only the subject's own ticks, the last 3", [e["dets"][0]["name"] for e in picked], ["dwell2", "dwell3", "dwell4"])
+    check("ticks older than 0.6 s are not used (at 100.45 only the 99.9 one is left)",
+          [e["dets"][0]["name"] for e in gs._pre_frames(4, 100.45)], ["dwell4"])
+    gs._state["cfg"]["burst_before"] = 9
+    check("burst_before is capped at frames - 1", gs.burst_before(), 4)
+    gs._state["cfg"]["burst_before"] = 0
+    check("burst_before 0 = all new, as before", gs._pre_frames(4, 100.0), [])
+finally:
+    for k, v in _saved.items():
+        setattr(gs, k, v)
+    gs._state["cfg"].pop("burst_before", None); gs._state["cfg"].pop("frames", None)
+    gs._pre_burst.clear()
 
 if fails:
     print("\n" + "\n".join(fails))

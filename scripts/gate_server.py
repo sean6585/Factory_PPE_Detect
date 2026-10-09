@@ -38,6 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ppe_check import _area, containment, evaluate, load_config   # noqa: E402
 from patlite_tower import LAMPS, SPEECH_LANGS, Tower, TowerError   # noqa: E402
 from whitelist import Whitelist                                    # noqa: E402
+from rfid_reader import pick_worker                                # noqa: E402
 from gate_light import LightDriver, LightPolicy                    # noqa: E402
 
 # Detections are returned above this floor and the checklist applies its own per-item
@@ -115,9 +116,24 @@ _gate_check_lock = threading.Lock()
 # the live check both see real-time video, never a backlog.
 _camera = {"frame": None, "lock": threading.Lock(), "ts": 0.0, "ok": False}
 
+# Realtime's own native-resolution stream (2026-10-07). Realtime samples are training
+# data, but the gate's pipeline is hardware-scaled to --cap-width x --cap-height
+# (1280x960): the 5 MP camera reduced to 1.2 MP before anything sees it. Raising the
+# gate's own capture instead would re-scale every px² setting (trigger_min_area and its
+# slider are calibrated in 1280x960 pixels) and slow every check burst (a 5 MP JPEG
+# encodes in ~58 ms vs ~14 ms). So realtime opens a SECOND session on the same camera at
+# its native size, only while the page polls it, and closes it when realtime stops.
+# Measured on this camera: native 2592x1944 holds 30 fps at ~84 % of one core (vs ~30 %
+# at 1280x960) — a cost paid only while realtime runs.
+_camera_full = {"frame": None, "ts": 0.0, "lock": threading.Lock(), "want_until": 0.0,
+                "running": False, "pipeline": None}
+REALTIME_FULL_IDLE_S = 10.0    # the full-res stream closes this long after the last poll
+REALTIME_FULL_FRESH_S = 1.0    # a full-res frame older than this is not "now"
+
 
 def build_camera_pipeline(rtsp: str, width: int, height: int, protocol: str = "tcp") -> str:
-    """Low-latency Jetson NVDEC pipeline, hardware-scaled to width x height.
+    """Low-latency Jetson NVDEC pipeline, hardware-scaled to width x height (0 x 0 =
+    the camera's native size, unscaled — realtime's full-resolution stream).
 
     protocol picks how rtspsrc carries RTP: "tcp" interleaves it inside the RTSP
     connection (no separate UDP ports, immune to UDP loss, but a lost/late TCP segment
@@ -129,12 +145,13 @@ def build_camera_pipeline(rtsp: str, width: int, height: int, protocol: str = "t
     dedicated link — so the choice here is "rare stall" vs "rare corrupted frame", not
     a clear latency win for either.
     """
+    size = f"width={width},height={height}," if width and height else ""
     return (
         f"rtspsrc location={rtsp} latency=0 protocols={protocol} "
         "drop-on-latency=true buffer-mode=none ! "
         "rtph264depay ! h264parse ! "
         "nvv4l2decoder disable-dpb=true enable-max-performance=true ! "
-        f"nvvidconv ! video/x-raw,width={width},height={height},format=BGRx ! "
+        f"nvvidconv ! video/x-raw,{size}format=BGRx ! "
         "videoconvert ! video/x-raw,format=BGR ! "
         "appsink drop=true max-buffers=1 sync=false"
     )
@@ -174,6 +191,61 @@ def camera_loop(pipeline: str):
         cap.release()
         _camera["ok"] = False
         time.sleep(1)
+
+
+def _full_wanted() -> bool:
+    return not _state.get("stop") and time.time() < _camera_full["want_until"]
+
+
+def full_camera_loop():
+    """Realtime's native-resolution stream: runs while realtime keeps polling
+    (full_frame() extends want_until), then closes itself and frees the frame."""
+    try:
+        while _full_wanted():
+            cap = cv2.VideoCapture(_camera_full["pipeline"], cv2.CAP_GSTREAMER)
+            if not cap.isOpened():
+                print("[camera-full] open failed, retry in 3s", flush=True)
+                time.sleep(3)
+                continue
+            print("[camera-full] connected (realtime, native resolution)", flush=True)
+            fails = 0
+            while _full_wanted():
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    fails += 1
+                    if fails > 30:
+                        print("[camera-full] stream stalled, reconnecting", flush=True)
+                        break
+                    time.sleep(0.02)
+                    continue
+                fails = 0
+                with _camera_full["lock"]:
+                    _camera_full["frame"] = frame
+                    _camera_full["ts"] = time.time()
+            cap.release()
+    finally:
+        with _camera_full["lock"]:
+            _camera_full["running"] = False
+            _camera_full["frame"] = None        # 15 MB, and a stale frame must never be "now"
+        print("[camera-full] closed (realtime idle)", flush=True)
+
+
+def full_frame():
+    """The newest native-resolution frame for realtime, or None while its stream is
+    still opening. Every call keeps the stream wanted for REALTIME_FULL_IDLE_S more,
+    and starts it if it is not running."""
+    if not _camera_full["pipeline"]:
+        return None
+    now = time.time()
+    with _camera_full["lock"]:
+        _camera_full["want_until"] = now + REALTIME_FULL_IDLE_S
+        if not _camera_full["running"]:
+            _camera_full["running"] = True
+            threading.Thread(target=full_camera_loop, name="CameraFull", daemon=True).start()
+        f, ts = _camera_full["frame"], _camera_full["ts"]
+    if f is None or now - ts > REALTIME_FULL_FRESH_S:
+        return None
+    return f.copy()
 
 
 def load_model(path: str, device: str, imgsz: int):
@@ -311,7 +383,7 @@ def announce(res: dict):
             say(_pass_voice(at, "it"))
         threading.Thread(target=speak, daemon=True, name="pass-voice").start()
     elif status == "FAIL":
-        say("fail")
+        say_to("fail", res.get("track_id"))
         signal("red_flash")
         if to_it:
             _post_check_now(res)
@@ -416,7 +488,13 @@ def _tags_text(rows) -> str:
     if not rows:
         return ""
     floor = _state["cfg"].get("rfid_min_rssi", RFID_MIN_RSSI_DEFAULT)
-    return "; ".join(f"{r['epc']} {r['rssi']:g} dBm x{r['reads']}"
+    multi = _rfid is not None and len(_rfid.antennas) > 1
+
+    def ants(r) -> str:
+        # Per-antenna peaks, only with several antennas: what calibrating them needs.
+        a = r.get("ants") or {}
+        return (" [" + " / ".join(f"A{k} {v:g}" for k, v in a.items()) + "]") if multi and a else ""
+    return "; ".join(f"{r['epc']} {r['rssi']:g} dBm x{r['reads']}{ants(r)}"
                      + (" (弱)" if r["rssi"] < floor else "")
                      for r in sorted(rows, key=lambda r: -r["rssi"]))
 
@@ -598,6 +676,30 @@ _realtime = {"jpeg": None, "last_save": 0.0, "saved": 0, "lock": threading.Lock(
 # Set by main() when --rfid-host is given. None means the gate runs without identity,
 # which is the default and a fully supported mode: the PPE check never depends on it.
 _rfid = None
+
+# On-site recording for replay (scripts/recorder.py): the camera stream plus a log of
+# what the gate saw and decided. Set by main() when the camera is on; idle until the
+# page's 錄影 button starts it.
+_recorder = None
+
+
+def _recording_meta() -> dict:
+    """The settings in force when a recording starts — what a replay must run with."""
+    cfg = _state["cfg"]
+    keys = ("model", "person_class", "person_conf", "track_person_conf", "trigger_min_area",
+            "trigger_zone", "door_side", "exit_area_fraction", "away_fraction", "image_dwell",
+            "frames", "burst_before", "rfid_min_rssi", "direction_source")
+    f = latest_frame()
+    return {"settings": {k: cfg.get(k) for k in keys}, "items": cfg.get("items"),
+            "gate_frame": [f.shape[1], f.shape[0]] if f is not None else None,
+            "tick_s": IMAGE_TRIGGER_PERIOD_S, "burst_interval": _state.get("burst_interval"),
+            "rfid": _rfid.settings() if _rfid else None}
+
+
+def _rec_log(kind: str, **fields) -> None:
+    """One line in the active recording's log; nothing (and next to no cost) otherwise."""
+    if _recorder is not None and _recorder.active:
+        _recorder.log(kind, **fields)
 
 
 def model_folder_name() -> str:
@@ -805,6 +907,8 @@ def queue_alarm_record(status: str, alarm_key: str | None, bgr, worker: str = ""
     out, it is the badges heard in the last rfid_before seconds as of now — for a crowd,
     a violation or an unregistered badge, who was at the gate.
     """
+    _rec_log("alarm", status=status, alarm=alarm_text or ALARM_TEXT.get(alarm_key, ("",))[0],
+             worker=worker, people=people, box=[int(v) for v in box] if box else None)
     if not _state.get("record") or bgr is None:
         return ""
     if tags is None and _rfid is not None:
@@ -1295,7 +1399,10 @@ def set_direction_source(src) -> dict:
 # puts it on the image's RIGHT. "left" is the default only because it is what the bench
 # was built and tested with; set it from what a worker walking to the door actually
 # does on the live view, never from the floor plan alone (a camera may mirror).
-DOOR_SIDES = ("left", "right")
+# "both" (operator, 2026-10-09): the door is at the camera's end, the band's two sides are
+# its walls, so a worker leaving can step into the band from EITHER side and one going in
+# leaves it by either side. See _is_door.
+DOOR_SIDES = ("left", "right", "both")
 
 
 # Leaving the plant, a worker steps out of the door SIDEWAYS, and a side-on box is only
@@ -1304,8 +1411,25 @@ DOOR_SIDES = ("left", "right")
 # came from the door's side therefore starts its (出場) visit at this fraction of AREA_TH.
 # Entering workers walk up facing the camera and keep the full AREA_TH, and nobody
 # arrives from the door's side but someone coming out, so background people gain nothing.
+# Above 1 (operator, 2026-10-09: 「出場的 person trigger 面積應該要比進場大」 — a worker
+# leaving comes out by the door, near the camera, and walks AWAY, box big → small) it
+# raises the bar instead: someone from the door's side must be that much bigger than
+# AREA_TH both to start their visit and to be checked (_gate_area). Below 1 the check
+# still needs the full AREA_TH, as before — only the visit starts early. The cost above 1:
+# a door-side worker who never gets that big is not followed at all, so walking out
+# unchecked is not seen for them, as for anyone under the area threshold.
 EXIT_AREA_FRACTION_DEFAULT = 0.6
-EXIT_AREA_FRACTION_RANGE = (0.2, 1.0)
+EXIT_AREA_FRACTION_RANGE = (0.2, 2.0)
+
+
+def _gate_area(d: dict, min_area: float) -> float:
+    """How big person box `d` must be to count as AT the gate (the dwell, the crowd rule):
+    AREA_TH, or exit_area_fraction of it when above 1 and the track came from the door's
+    side. Reads the track's remembered side (_visits[tid]["came_from"]) from earlier ticks."""
+    v = _visits.get(d.get("tid")) or {}
+    if _is_door(v.get("came_from")):
+        return min_area * max(1.0, exit_area_fraction())
+    return min_area
 
 
 # Where "walked away" starts, as a fraction of AREA_TH (of the visit's own peak, for a
@@ -1318,6 +1442,39 @@ AWAY_FRACTION_RANGE = (0.3, 0.8)    # operator raised the cap from 0.7 (2026-10-
                                     # the cost: a side-on box is ~55-65 % of a front-on one,
                                     # so above ~0.7 a worker turning to the door can read as
                                     # walking off (losing their PASS) — theirs to weigh
+
+
+# How long one person must stand in the door zone before the check runs — the page's
+# 「停留」 (2026-10-07; before that only --image-dwell). gate.json's image_dwell wins over
+# --image-dwell, which is only the starting value, the same as `model`. Shorter = faster,
+# but a worker still stepping into place gets judged mid-step, and the RFID window looks
+# back --rfid-before seconds from the end of the dwell. The live value is _state's.
+IMAGE_DWELL_RANGE = (0.3, 5.0)
+
+
+def _dwell_from(cfg: dict, fallback: float) -> float:
+    """The dwell to start with: gate.json's if it holds a usable one, else --image-dwell."""
+    lo, hi = IMAGE_DWELL_RANGE
+    try:
+        sec = float(cfg.get("image_dwell", fallback))
+    except (TypeError, ValueError):
+        sec = fallback
+    return min(max(sec, lo), hi)
+
+
+def set_image_dwell(seconds) -> dict:
+    lo, hi = IMAGE_DWELL_RANGE
+    try:
+        sec = float(seconds)
+    except (TypeError, ValueError):
+        raise ValueError("Dwell must be a number of seconds")
+    if not lo <= sec <= hi:
+        raise ValueError(f"Dwell must be between {lo:g} and {hi:g} s")
+    _state["image_dwell"] = _state["cfg"]["image_dwell"] = round(sec, 2)
+    save_config()
+    print(f"[config] image_dwell={_state['image_dwell']} s "
+          f"(saved to {_state.get('config_path')})", flush=True)
+    return {"image_dwell": _state["image_dwell"]}
 
 
 def away_fraction() -> float:
@@ -1390,30 +1547,51 @@ RFID_MODE_DEFAULT = 103     # what the gate ran before the setting existed
 RFID_POWER_RANGE = (5.0, 33.0)   # what the page offers; the READER has the final say
 
 
+def _antenna_settings_from(cfg: dict) -> dict[int, tuple[float, int]]:
+    """gate.json rfid_antenna_settings ({"1": {"power_dbm", "rf_mode"}, …}) as
+    RfidService wants it. Ports without an entry fall back to rfid_power_dbm /
+    rfid_rf_mode — which is all a gate.json from before 2026-10-07 has."""
+    out = {}
+    for k, v in (cfg.get("rfid_antenna_settings") or {}).items():
+        try:
+            out[int(k)] = (float(v["power_dbm"]), int(v["rf_mode"]))
+        except (KeyError, TypeError, ValueError):
+            print(f"[config] ignoring rfid_antenna_settings[{k!r}]: {v!r}", flush=True)
+    return out
+
+
 def rfid_settings() -> dict:
+    ants = _rfid.settings() if _rfid else {}
     return {"available": _rfid is not None,
             "connected": bool(_rfid and _rfid.connected),
+            # The first antenna's, as the single setting used to be (older pages read it).
             "power_dbm": _rfid.power_dbm if _rfid else None,
             "rf_mode": _rfid.rf_mode if _rfid else None,
+            "antennas": [{"antenna": a, **s} for a, s in ants.items()],
             "power_range": RFID_POWER_RANGE,
             "modes": [{"value": k, "label": v[0], "sensitivity": v[1]} for k, v in RFID_MODES.items()]}
 
 
-def set_rfid_settings(power, mode) -> dict:
-    """Apply live, and keep it only if the reader accepted it (a refused value is put
-    back by the reader service and never saved)."""
+def set_rfid_settings(power, mode, antenna=None) -> dict:
+    """Apply live — to one antenna, or to every antenna when none is named — and keep
+    it only if the reader accepted it (a refused value is put back by the reader
+    service and never saved)."""
     try:
         power, mode = float(power), int(mode)
+        antenna = None if antenna in (None, "") else int(antenna)
     except (TypeError, ValueError):
-        raise ValueError("power must be a number and mode an integer")
+        raise ValueError("power must be a number, mode and antenna integers")
     if not RFID_POWER_RANGE[0] <= power <= RFID_POWER_RANGE[1]:
         raise ValueError(f"power must be {RFID_POWER_RANGE[0]:g}-{RFID_POWER_RANGE[1]:g} dBm")
     if mode not in RFID_MODES:
         raise ValueError(f"mode must be one of {', '.join(map(str, RFID_MODES))}")
-    out = _rfid.reconfigure(power, mode)
+    out = _rfid.reconfigure(power, mode, antenna)
     if out.get("ok"):
-        _state["cfg"]["rfid_power_dbm"] = out["power_dbm"]
-        _state["cfg"]["rfid_rf_mode"] = out["rf_mode"]
+        _state["cfg"]["rfid_antenna_settings"] = {str(a): s for a, s in _rfid.settings().items()}
+        # The single setting stays, as the first antenna's, for a gate run without the
+        # per-antenna one (and for anything still reading it).
+        _state["cfg"]["rfid_power_dbm"] = _rfid.power_dbm
+        _state["cfg"]["rfid_rf_mode"] = _rfid.rf_mode
         save_config()
     out.update(rfid_settings())
     return out
@@ -1529,7 +1707,7 @@ class GateNotReady(RuntimeError):
 
 
 def run_gate_check(worker: str = "", source: str = "api", rfid: dict | None = None,
-                   intent: str | None = None) -> dict:
+                   intent: str | None = None, tid=None, pre: list | None = None) -> dict:
     """One complete gate check: burst, detect, vote, announce, record. Returns the result.
 
     THIS is the gate trigger, and every trigger must come through here — the button,
@@ -1563,7 +1741,20 @@ def run_gate_check(worker: str = "", source: str = "api", rfid: dict | None = No
     trigger_t = time.monotonic()
     n = int(_state["cfg"].get("frames", 5))
     ids = []
-    for k in range(n):
+    # Frames the image trigger already detected during the dwell (_pre_frames), oldest
+    # first — at most n-1, so at least one is always taken after the trigger.
+    for e in (pre or [])[-max(0, n - 1):]:
+        ok, enc = cv2.imencode(".jpg", e["f"], [int(cv2.IMWRITE_JPEG_QUALITY), CAPTURE_JPEG_QUALITY])
+        if ok:
+            h, w = e["f"].shape[:2]
+            ids.append(store_frame(enc.tobytes(), e["dets"], w, h))
+    n_pre = len(ids)
+    for k in range(n - n_pre):
+        if ids:
+            # Deliberate pause, and the largest part of a tap. See --burst-interval:
+            # voting only means anything if the frames differ — and that holds between
+            # the last frame kept from the dwell and the first new one too.
+            time.sleep(_state["burst_interval"])
         f = latest_frame()
         if f is None:
             break
@@ -1573,10 +1764,9 @@ def run_gate_check(worker: str = "", source: str = "api", rfid: dict | None = No
             continue
         h, w = f.shape[:2]
         ids.append(store_frame(enc.tobytes(), dets, w, h))
-        if k < n - 1:
-            # Deliberate pause, and the largest part of a tap. See --burst-interval:
-            # voting only means anything if the frames differ.
-            time.sleep(_state["burst_interval"])
+    if n_pre:
+        print(f"[check] burst: {n_pre} frame(s) from the dwell + {len(ids) - n_pre} new, "
+              f"{time.monotonic() - trigger_t:.2f} s", flush=True)
     if not ids:
         raise GateNotReady("Could not grab any live frames")
 
@@ -1600,7 +1790,7 @@ def run_gate_check(worker: str = "", source: str = "api", rfid: dict | None = No
         else:
             print("[rfid] no tag seen in the window — worker id left blank", flush=True)
 
-    res = finalize_check(ids, worker, source=source, intent=intent)
+    res = finalize_check(ids, worker, source=source, intent=intent, tid=tid)
     # "in" / "out" from the bbox track, when the image trigger knew it. The button and the
     # beam sensor have no track to read, so their checks leave it unset.
     res["intent"] = intent
@@ -1681,14 +1871,17 @@ def _run_sensor_check() -> None:
 # just walk up and stand still — which is why it replaced the through-beam sensor as
 # the default; that path stays available behind its own toggle.
 #
-# Before the check runs, the RFID reader decides whether it's ONE person:
-#   exactly one tag at or above cfg rfid_min_rssi in the last --rfid-before seconds
-#     → run the check with that EPC as the worker ID.
+# Before the check runs, the RFID reader names the worker (rfid_reader.pick_worker):
+#   tags at or above cfg rfid_min_rssi in the last --rfid-before seconds, a tag's
+#   strength being its peak over every antenna (--rfid-antenna 1,3 = the union)
+#     → the STRONGEST is the worker; run the check with that EPC.
 #   none  → 「ID讀取失敗」 + red flash, no check. Nobody badged, and a verdict without an
 #           identity can't be traced to anyone. (Reader down: silent, red steady.)
-#   >= 2  → 「檢測口請淨空」 + yellow flash, no check. Two badges close in means two people
-#           at the gate, and the checklist can only judge one — refusing is safer
-#           than guessing which of them the verdict belongs to.
+# Two or more used to refuse with 「檢測口請淨空」 (two badges = two people, so don't
+# guess whose verdict it is). With two antennas across the walkway the next worker in
+# line was heard above the floor so often that the gate kept refusing, and the operator
+# chose the strongest instead (2026-10-07) — accepting a wrong name when two badges are
+# close in strength. Two PEOPLE in the door zone (the camera's crowd rule) still refuse.
 # Every refusal is spoken, every time — including the same worker refused again a few
 # seconds later (operator, 2026-09-30).
 # Once the tags change (someone steps back, someone badges) or the person leaves the
@@ -1720,10 +1913,54 @@ IMAGE_TRIGGER_COOLDOWN_FAIL_S = 0.5   # a worker who failed is still standing th
                                       # (check_fail.mp3 is 1.78 s): re-checking before they
                                       # have heard why they failed helps nobody, and with the
                                       # dwell on top this still lands ~2.3 s after the verdict.
+IMAGE_TRIGGER_COOLDOWN_ID_S = 0.5     # after 「ID讀取失敗」 / 「ID未登入」 (operator, 2026-10-07:
+                                      # "比照檢測未通過" — the worker is still standing there
+                                      # sorting out their badge). Measured from the refusal,
+                                      # which has no burst before it, so the next one comes
+                                      # ~1.7 s later (this + the 1.2 s dwell): sooner than
+                                      # id_read_fail.mp3 lasts (2.09 s; ID_not_registered 1.80).
+                                      # Whether the tower cuts the playing voice off for the
+                                      # next or ignores the new command is unmeasured. Crowd
+                                      # and reader-down keep IMAGE_TRIGGER_COOLDOWN_S.
 # Both debounces are measured in SECONDS, not ticks. They used to be tick counts (5 and
 # 3), which silently halved when the tick rate doubled — the crowd confirm would have
 # dropped to ~0.3 s and let the phantom-box false alarms back in. Time keeps their
 # meaning fixed whatever the tick rate, including when a busy GPU stretches a tick.
+# The check's first frames come from the dwell itself (operator, 2026-10-07: 「前 3 個
+# frame + 後 2 個」). The trigger loop already runs the model on the newest frame every
+# tick while the worker stands there; those detections used to be thrown away and the
+# burst then took 5 fresh frames, ~0.68 s from dwell to verdict (journal, 92 checks).
+# Now the last `burst_before` ticks of the SAME worker in the door zone are voted on
+# with the rest taken fresh — 3 + 2 → ~0.3 s. Ticks are 0.1 s apart, so they are
+# distinct camera frames (see --burst-interval). At least one frame is always taken
+# after the trigger, so the verdict never rests only on what was seen before it.
+BURST_BEFORE_DEFAULT = 3
+PRE_BURST_MAX_AGE_S = 0.6        # an older tick is not "the moment of the trigger"
+_pre_burst: deque = deque(maxlen=6)   # {"t", "f", "dets", "tid"} of recent in-zone ticks
+
+
+def burst_before() -> int:
+    """How many of the check's frames come from the dwell (gate.json burst_before),
+    leaving at least one to be taken after the trigger."""
+    n = int(_state["cfg"].get("frames", 5))
+    try:
+        k = int(_state["cfg"].get("burst_before", BURST_BEFORE_DEFAULT))
+    except (TypeError, ValueError):
+        k = BURST_BEFORE_DEFAULT
+    return max(0, min(k, n - 1))
+
+
+def _pre_frames(tid, t: float) -> list[dict]:
+    """The last burst_before() dwell ticks of track `tid` (any, without a track ID),
+    none older than PRE_BURST_MAX_AGE_S before t, oldest first."""
+    k = burst_before()
+    if k <= 0:
+        return []
+    picks = [e for e in list(_pre_burst)
+             if 0 <= t - e["t"] <= PRE_BURST_MAX_AGE_S and (tid is None or e["tid"] == tid)]
+    return picks[-k:]
+
+
 IMAGE_TRIGGER_MISS_S = 1.0       # nobody qualifying in the zone for this long, unbroken,
                                  # and the visit is over. Crucially the dwell timer keeps
                                  # running underneath: a worker the model drops for a few
@@ -1945,7 +2182,7 @@ IT_VOICE_WAIT_S = 1.5       # how long a PASS voice waits for IT's access_type
 #   it    (IT 回報):  no — plain 「檢測通過」 at once, no waiting on IT's reply (2026-10-05).
 # Either way the direction is still worked out and still judges went-through /
 # violations; this only decides the spoken words (and the 大字報 shows the same).
-PASS_VOICE_SAYS_DIRECTION = {"track": True, "it": False}
+PASS_VOICE_SAYS_DIRECTION = {"track": True, "it": True}
 
 
 def pass_voice_says_direction(mode: str | None = None) -> bool:
@@ -2039,6 +2276,42 @@ def say(key: str) -> None:
     threading.Thread(target=run, daemon=True, name="tower-voice").start()
 
 
+# The same words to the same person within VOICE_REPEAT_S are spoken once (operator,
+# 2026-10-07: 「同一個人 5 秒內相同內容只播一次」). A worker who stays at the gate was told
+# 「ID讀取失敗」 every ~2 s: on site, about half of every ID讀取失敗 / 檢測未通過 / 檢測口請淨空 /
+# ID未登入 came within 6 s of the same words before it (10-05..07, up to 20 in a row). Only
+# those four repeat; PASS and every violation are one-off events and always spoken. The
+# light, the record and the screen are unchanged — only the voice stays quiet. Measured
+# from the last time it was SPOKEN, so someone who stays hears it again every ~6 s.
+# "Same person" is the same VISIT (track ID + when the visit started): walking off and
+# coming back is a new visit and is spoken to again — the case that got the old
+# badge-based "don't repeat" removed on 2026-09-30. No track ID (button, sensor, a tracker
+# hiccup): always spoken.
+VOICE_REPEAT_S = 5.0
+VOICE_REPEAT_KEYS = frozenset({"no_tag", "unregistered", "fail", "crowd"})
+_voice_said: dict[tuple, float] = {}       # (voice key, tid, visit start) -> last spoken
+_voice_lock = threading.Lock()
+
+
+def say_to(key: str, tid=None, now: float | None = None) -> bool:
+    """say(key) to the person on track `tid`, unless they heard these same words less
+    than VOICE_REPEAT_S ago in this visit. Returns whether it was spoken."""
+    if key in VOICE_REPEAT_KEYS and tid is not None:
+        v = _visits.get(tid) or {}
+        who = (key, tid, v.get("started"))
+        now = time.monotonic() if now is None else now
+        with _voice_lock:
+            for k in [k for k, t in _voice_said.items() if now - t >= VOICE_REPEAT_S]:
+                del _voice_said[k]
+            if who in _voice_said:
+                print(f"[voice] {key} to #{tid} again within {VOICE_REPEAT_S:g} s — not "
+                      "spoken (light, record and screen as usual)", flush=True)
+                return False
+            _voice_said[who] = now
+    say(key)
+    return True
+
+
 def signal(name: str, hold_s: float = FLASH_HOLD_S, tag: str = "") -> None:
     """Put a flash on the tower light (gate_light.LightPolicy decides what actually shows:
     red steady for a device fault outranks it)."""
@@ -2105,7 +2378,9 @@ def device_status() -> str:
 # of them, and each one is deleted a few seconds after its ID leaves the frame.
 #
 # The site's geometry: one side of the door band is the restricted side (the door,
-# door_side(): left or right of the IMAGE), the other is the entrance side.
+# door_side(): left or right of the IMAGE), the other is the entrance side — or, with
+# door_side "both", both sides are the door and the entrance is only straight ahead
+# (walking up from / away into the far end of the picture).
 #   intent     decided the moment an ID first reaches the band big enough to count
 #              (area ≥ AREA_TH). Came from the door's region → "out" (leaving the
 #              restricted area); from the other side, or appeared inside the band from
@@ -2148,16 +2423,17 @@ def _side(cx: float, zone) -> str:
     return "L" if cx < zone[0] else "R" if cx > zone[1] else "B"
 
 
-def _door_letter() -> str:
-    """_side()'s letter for the door's (restricted) region."""
-    return "L" if door_side() == "left" else "R"
+def _is_door(letter) -> bool:
+    """Is this _side() letter ("L", "R", "B" or None) the door's (restricted) region?
+    One side for door_side left/right; both sides for "both"."""
+    return letter in {"left": ("L",), "right": ("R",), "both": ("L", "R")}[door_side()]
 
 
 def _visit_start(v: dict, came_from, now: float, area: float) -> None:
     """Begin a visit: the ID has just reached the band big enough to count. Intent is the
     side it last came from (came_from) — the door's region means it is walking out."""
-    v.update(engaged=True, resolved=False,
-             intent="out" if came_from == _door_letter() else "in",
+    v.update(engaged=True, resolved=False, started=now,     # started: say_to's "same visit"
+             intent="out" if _is_door(came_from) else "in",
              intent_it=None, checks=[], last_activity=now,
              away_since=None, away_blocked=False, rearm=False, peak=area)
 
@@ -2229,10 +2505,24 @@ def _visit_update(persons: list[dict], min_area: float, zone, now: float, frame)
         # the band: a side-on worker out of the door may only grow past the exit bar a
         # few ticks INSIDE the band. Small in the middle of the frame = far down the
         # entrance path, which wipes it: whoever walks up from there is coming in.
+        # Out of the DOOR counts only for a box already at the exit bar (exit_area_fraction
+        # × AREA_TH) there, on a track never smaller than that before (operator,
+        # 2026-10-09: 「面積也要大於門檻」). The door is at the camera, so a worker stepping
+        # out of it is big from the first sighting; someone walking up the hall along that
+        # side starts small — the 2026-10-08 recording's #240, 100k against a 190k AREA_TH,
+        # read as leaving once the zone edge moved in. A door-side sighting that does not
+        # qualify leaves the origin as it was. The bar here stops at AREA_TH: a multiplier
+        # above 1 raises when a worker from the door is followed and checked (_gate_area),
+        # and must not turn a door-side worker under it into one walking in — who would
+        # then be checked sooner, at the plain AREA_TH, not later.
+        door_min = min_area * min(1.0, exit_area_fraction())
         if side != "B":
-            v["came_from"] = side
+            if not _is_door(side) or (area >= door_min and not v.get("was_small")):
+                v["came_from"] = side
         elif area < CROSS_MIN_AREA_FRACTION * min_area:
             v["came_from"] = None
+        if area < door_min:
+            v["was_small"] = True
         if v["engaged"] and not v["resolved"]:
             v["peak"] = max(v.get("peak") or 0.0, area)
         small = area < (_away_line(v, min_area) if v["engaged"]
@@ -2240,7 +2530,7 @@ def _visit_update(persons: list[dict], min_area: float, zone, now: float, frame)
         # Big enough to be at the gate: AREA_TH, or exit_area_fraction of it for a track
         # out of the door's side (EXIT_AREA_FRACTION_DEFAULT). A box under person_conf is
         # only being FOLLOWED (track_person_conf): it can carry a visit on, never start one.
-        need = min_area * (exit_area_fraction() if v.get("came_from") == _door_letter()
+        need = min_area * (exit_area_fraction() if _is_door(v.get("came_from"))
                            else 1.0)
         at_gate = side == "B" and area >= need and d.get("firm", True)
         if v["resolved"] and small:
@@ -2257,7 +2547,7 @@ def _visit_update(persons: list[dict], min_area: float, zone, now: float, frame)
                 # an entering worker giving up.
                 _visit_resolve(v, away_how, frame, box=d["box"], via="away")
             elif prev == "B" and side != "B":
-                went_through = (side == _door_letter()) == (intent == "in")
+                went_through = _is_door(side) == (intent == "in")
                 if small and v.get("away_since") is not None:
                     # Already walking away, and drifted out of the band on the way.
                     _visit_resolve(v, away_how, frame, box=d["box"], via="away")
@@ -2378,6 +2668,14 @@ def _visit_resolve(v: dict, how: str, frame, box=None, via: str = "edge") -> Non
     carrying the frame of that moment. Nothing here is ever spoken.
     """
     v["resolved"] = True
+    if via == "away":
+        # Walked away from the camera: whatever side this track came from no longer says
+        # anything about it. Kept, a worker who came out of the door, walked off far enough
+        # to count as gone, turned and came back carried "from the door's side" into the
+        # next visit — read as leaving again, so walking back INTO the door ended "back"
+        # (returning where they came from) and the intrusion went unreported (2026-10-08
+        # recording, #242). Cleared, the way back is a new 進場 visit.
+        v["came_from"] = None
     intent = v.get("intent_it") or v["intent"]       # IT's access_type, when it answered
     last = v["checks"][-1] if v["checks"] else None
     # The worker whose PASS window is open has now left the band one way or the other:
@@ -2407,6 +2705,8 @@ def _visit_resolve(v: dict, how: str, frame, box=None, via: str = "edge") -> Non
                       f"FAILED within {RECALL_S:g} s — counted as 未通過", flush=True)
         violation = VIOLATION_TEXT[(kind, intent)]
     departure = {"through": intent, "back": "back", "stayed": "none", "lost": "unknown"}[how]
+    _rec_log("visit", track=v["tid"], how=how, via=via, intent=intent, departure=departure,
+             violation=violation)
     # IT hears about every visit that had a PPE result, every violation, and every badge
     # the whitelist refused. Other refusals alone (crowd, two badges, no badge) are
     # warnings only — unless the worker then went through anyway, a violation.
@@ -2486,7 +2786,7 @@ def _refuse_unregistered(tid, epc: str) -> None:
     direction = INTENT_TEXT.get((_visits.get(tid) or {}).get("intent"), "")
     image = ""
     print(f"[image] refused — {epc} is not on the whitelist: ID未登入", flush=True)
-    say("unregistered")
+    say_to("unregistered", tid)
     signal("red_flash")
     v = _visits.get(tid) or {}
     image = queue_alarm_record("UNREGISTERED", "unregistered", latest_frame(), worker=epc,
@@ -2574,7 +2874,7 @@ def image_trigger_loop() -> None:
         # that day's 100 「檢測口請淨空」 refusals only 4 had two people inside the zone.
         # The subject is the largest person IN the zone; with nobody there, the largest
         # anywhere, only so the status line can say "outside door zone".
-        people = [d for d in persons if d["firm"] and _area(d["box"]) >= min_area]
+        people = [d for d in persons if d["firm"] and _area(d["box"]) >= _gate_area(d, min_area)]
         W = f.shape[1]
         people_in = [d for d in people
                      if zone[0] <= (d["box"][0] + d["box"][2]) / 2 / W <= zone[1]]
@@ -2593,6 +2893,8 @@ def image_trigger_loop() -> None:
         except Exception as e:
             print(f"[visit] update failed: {type(e).__name__}: {e}", flush=True)
         subject_tid = subject.get("tid") if subject else None
+        if in_zone:
+            _pre_burst.append({"t": now, "f": f, "dets": dets, "tid": subject_tid})
         outcome = None
         with it["lock"]:
             it["watching"] = True
@@ -2677,6 +2979,14 @@ def image_trigger_loop() -> None:
                     if now - it["miss_since"] >= IMAGE_TRIGGER_MISS_S:
                         # Gone — whichever way they went, the visit ends in silence.
                         _dwell_clear(it)
+        # Every tick into the recording's log: what replaying the video must reproduce.
+        # Boxes in gate-frame pixels; a person's entry ends with its track ID.
+        _rec_log("tick", dets=[[d["name"], round(d["score"], 3)] + [int(v) for v in d["box"]]
+                               + ([d.get("tid")] if d["name"] == cfg["person_class"] else [])
+                               for d in dets],
+                 subject=subject_tid, in_zone=in_zone, people=len(people_in),
+                 dwell=round(now - it["dwell_start"], 2) if it["dwell_start"] else None,
+                 outcome=outcome)
         if pass_timed_out is not None:
             # Passed, and still has not crossed the band when the window closed: a warning,
             # and — since the cooldown ends with the window — the normal re-check follows.
@@ -2706,13 +3016,13 @@ def image_trigger_loop() -> None:
                 parts.append(s)
             _image_trigger_refuse("crowd", f"{len(people_in)} people over {min_area} px² "
                                            f"in the zone for {CROWD_CONFIRM_S:g} s: "
-                                           + "  |  ".join(parts))
+                                           + "  |  ".join(parts), tid=subject_tid)
             queue_alarm_record("CROWD", "crowd", f, people=len(people_in), box=big,
                                score=ranked[0]["score"],
                                direction=INTENT_TEXT.get(subject.get("intent") if subject else None, ""))
 
 
-def _image_trigger_refuse(outcome: str, why: str) -> None:
+def _image_trigger_refuse(outcome: str, why: str, tid=None) -> None:
     """A refusal decided by the camera alone — no RFID read, no burst. 「檢測口請淨空」
     and a yellow flash: a crowd is a warning (operator, 2026-09-30), not a fail.
 
@@ -2727,7 +3037,7 @@ def _image_trigger_refuse(outcome: str, why: str) -> None:
                             "area": it["person_area"]}
         it["alarm_until"] = time.monotonic() + ALARM_HOLD_S
     print(f"[image] {outcome}: {why} -> 檢測口請淨空", flush=True)
-    say("crowd")
+    say_to("crowd", tid)
     signal("yellow_flash")
 
 
@@ -2749,35 +3059,39 @@ def _image_trigger_fire(t: float, area: int, tid=None) -> None:
         outcome = "check"
     else:
         rows = _rfid.obs.summary(t, _state["rfid_before"])
-        near = [r for r in rows if r["rssi"] >= min_rssi]
-        epcs = sorted(r["epc"] for r in near)
+        # The strongest badge at or above the floor, over every antenna (pick_worker —
+        # it used to be "exactly one, else 檢測口請淨空"; operator, 2026-10-07).
+        best, near = pick_worker(rows, min_rssi)
+        epcs = [r["epc"] for r in near]                # strongest first: epcs[0] is best
         heard = ", ".join(f"{r['epc']} {r['rssi']} dBm" for r in rows) or "nothing"
-        if len(near) == 1:
+        if best:
             outcome = "check"
-            best = near[0]
             rfid = {"epc": best["epc"], "rssi": best["rssi"], "reads": best["reads"],
                     "candidates": rows}
-            # One badge, so we know who it is — and it may still not be allowed in. None
-            # (no whitelist file) lets it through, exactly as before the list existed.
+            # We know who it is — and they may still not be allowed in. None (no
+            # whitelist file) lets it through, exactly as before the list existed.
             if _whitelist is not None and _whitelist.allowed(best["epc"]) is False:
                 outcome = "unregistered"
-        elif not near:
-            outcome = "no_tag" if _rfid.connected else "reader_down"
         else:
-            outcome = "multi"
+            outcome = "no_tag" if _rfid.connected else "reader_down"
+        chose = (f"; took the strongest, {near[0]['rssi'] - near[1]['rssi']:.1f} dB over "
+                 f"{near[1]['epc']}" if len(near) > 1 else "")
         print(f"[image] person area={area} dwelled {_state['image_dwell']:g}s; "
-              f"tags >= {min_rssi:g} dBm: {len(near)} (heard: {heard}) -> {outcome}",
+              f"tags >= {min_rssi:g} dBm: {len(near)} (heard: {heard}) -> {outcome}{chose}",
               flush=True)
 
     with it["lock"]:
         it["last_event"] = {"t": stamp, "outcome": outcome, "epcs": epcs, "area": area}
         it["alarm_until"] = time.monotonic() + ALARM_HOLD_S
+        if outcome in ("no_tag", "unregistered"):
+            it["next_allowed"] = time.monotonic() + IMAGE_TRIGGER_COOLDOWN_ID_S
 
     if outcome == "check":
         with _gate_check_lock:
             try:
                 intent = (_visits.get(tid) or {}).get("intent")
-                res = run_gate_check("", source="image", rfid=rfid, intent=intent)
+                res = run_gate_check("", source="image", rfid=rfid, intent=intent, tid=tid,
+                                     pre=_pre_frames(tid, t))
                 _visit_attach(tid, res["status"], res)
                 if rfid and res["status"] in ("PASS", "FAIL"):
                     _badge_results[rfid["epc"]] = (time.monotonic(), res["status"])
@@ -2806,17 +3120,13 @@ def _image_trigger_fire(t: float, area: int, tid=None) -> None:
     # EVERY check speaks and flashes — the operator's rule (2026-09-30): "每一次的檢測都要
     # 有語音". There used to be a "don't repeat for the same badges" rule; it silenced a
     # worker who walked away and came back under the same track ID, which is exactly the
-    # case the gate must not go quiet on. Two badges read like two people: the crowd's
-    # words and yellow. No badge, or a reader that is down: 「ID讀取失敗」 and red (with
-    # the reader down, the light's red steady outranks the flash).
-    if outcome == "multi":
-        say("crowd"); signal("yellow_flash")
-    else:
-        say("no_tag"); signal("red_flash")
+    # case the gate must not go quiet on. No badge, or a reader that is down: 「ID讀取失敗」
+    # and red (with the reader down, the light's red steady outranks the flash). Two
+    # badges are no longer a refusal (pick_worker, 2026-10-07); old MULTI_TAG rows stay
+    # readable in See Records.
+    say_to("no_tag", tid); signal("red_flash")
     print(f"[image] refused — {outcome}: {ALARM_TEXT[outcome][0]}", flush=True)
-    # worker_id carries every badge that counted, so a MULTI_TAG row says whose they were.
-    queue_alarm_record({"multi": "MULTI_TAG", "no_tag": "NO_TAG",
-                        "reader_down": "READER_DOWN"}[outcome], outcome,
+    queue_alarm_record({"no_tag": "NO_TAG", "reader_down": "READER_DOWN"}[outcome], outcome,
                        latest_frame(), worker=" ".join(epcs), people=it["people"],
                        direction=INTENT_TEXT.get((_visits.get(tid) or {}).get("intent"), ""),
                        tags=rows, box=(_visits.get(tid) or {}).get("box"),
@@ -2824,7 +3134,7 @@ def _image_trigger_fire(t: float, area: int, tid=None) -> None:
 
 
 def finalize_check(ids: list[str], worker: str, preview: bool = False,
-                   source: str = "api", intent: str | None = None) -> dict:
+                   source: str = "api", intent: str | None = None, tid=None) -> dict:
     """Vote the checklist over a burst of already-detected frames and record it.
     Shared by the file-upload path (/api/check) and the live path (/api/capture).
 
@@ -2861,6 +3171,11 @@ def finalize_check(ids: list[str], worker: str, preview: bool = False,
         return res
     res["source"] = source          # before announce(): an image-trigger PASS asks IT first
     res["intent"] = intent          # ...and in track mode says the track's direction
+    res["track_id"] = tid           # ...and a FAIL to the same visit is said once per 5 s
+    _rec_log("check", status=res.get("status"), worker=res.get("worker_id"), source=source,
+             intent=intent, track=tid,
+             items={i["label"]: {"ok": i["ok"], "votes": i["votes"], "frames": i["frames"]}
+                    for i in res.get("items", []) if isinstance(i, dict)})
     _last_result["result"] = res
     announce(res)
     def _item_log(i):
@@ -2893,6 +3208,23 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_file(self, path: str, ctype: str, name: str):
+        """Stream a file (a recording runs to gigabytes) instead of reading it whole."""
+        size = os.path.getsize(path)
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+        self.end_headers()
+        with open(path, "rb") as fh:
+            remaining = size                 # a recording still running keeps growing
+            while remaining > 0:
+                chunk = fh.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
 
     def _json(self, obj, code=200):
         self._send(code, json.dumps(obj).encode())
@@ -3233,9 +3565,11 @@ class Handler(BaseHTTPRequestHandler):
                     "last_seen": time.strftime("%H:%M:%S", time.localtime(r["last_t"] + offset)),
                     "age": round(time.monotonic() - r["last_t"], 1),
                     "registered": _whitelist.allowed(r["epc"]) if _whitelist else None,
+                    "ants": r.get("ants") or {},
                 })
             return self._json({
                 "enabled": True, "connected": _rfid.connected,
+                "antennas": _rfid.antennas,
                 "whitelist": _whitelist.state() if _whitelist else None,
                 "horizon_s": _rfid.obs.horizon_s,
                 "min_rssi": _state["cfg"].get("rfid_min_rssi", RFID_MIN_RSSI_DEFAULT),
@@ -3288,7 +3622,11 @@ class Handler(BaseHTTPRequestHandler):
             frame = latest_frame()
             if frame is None:
                 return self._err(503, "Camera not connected yet")
-            dets, ms = detect(frame)
+            # Detect and save on the camera's native resolution (see _camera_full); the
+            # gate-size frame stands in only while that stream is still opening.
+            full = full_frame() if _state.get("realtime_full") else None
+            src = frame if full is None else full
+            dets, ms = detect(src)
 
             # Single frame, judged on its own: the summary tracks what the model sees
             # right now rather than lagging behind a vote window.
@@ -3298,9 +3636,12 @@ class Handler(BaseHTTPRequestHandler):
             now = time.time()
             with _realtime["lock"]:
                 due = now - _realtime["last_save"] >= _state["realtime_interval"]
-            if due and _state.get("record"):
+            # Never a gate-size stand-in into a full-resolution dataset: while the native
+            # stream opens (~1-2 s) nothing is saved.
+            if due and _state.get("record") and (full is not None
+                                                 or not _state.get("realtime_full")):
                 try:
-                    saved = save_realtime_sample(frame, dets, res)
+                    saved = save_realtime_sample(src, dets, res)
                 except Exception as e:
                     print(f"[realtime] could not save sample: {e}", flush=True)
                 # The clock advances only on an actual write, not on every attempt. An
@@ -3312,12 +3653,25 @@ class Handler(BaseHTTPRequestHandler):
                         _realtime["last_save"] = now
                         _realtime["saved"] += 1
 
-            ok, enc = cv2.imencode(".jpg", frame,
+            # The page gets the preview and the boxes in the GATE frame's pixels: a 5 MP
+            # preview four times a second would be ~1 MB per tick for the browser to
+            # decode, and the page's area slider and box filter speak gate-frame px².
+            h, w = frame.shape[:2]
+            preview = src
+            if full is not None:
+                fh, fw = full.shape[:2]
+                kx, ky = w / fw, h / fh
+                scale = lambda b: [b[0] * kx, b[1] * ky, b[2] * kx, b[3] * ky]
+                for d in res["detections"]:
+                    d["box"] = scale(d["box"])
+                if res.get("person_box"):
+                    res["person_box"] = scale(res["person_box"])
+                preview = cv2.resize(full, (w, h), interpolation=cv2.INTER_AREA)
+            ok, enc = cv2.imencode(".jpg", preview,
                                    [int(cv2.IMWRITE_JPEG_QUALITY), REALTIME_PREVIEW_QUALITY])
             if ok:
                 with _realtime["lock"]:
                     _realtime["jpeg"] = enc.tobytes()
-            h, w = frame.shape[:2]
             return self._json({
                 "status": res["status"], "items": res["items"],
                 "detections": res["detections"], "person_box": res.get("person_box"),
@@ -3325,6 +3679,10 @@ class Handler(BaseHTTPRequestHandler):
                 "extra_people": res.get("extra_people", 0),
                 "width": w, "height": h, "infer_ms": ms,
                 "saved": saved, "saved_total": _realtime["saved"],
+                # What samples are saved at: [w, h] of the frame judged; null while the
+                # native stream is still opening (nothing is saved then).
+                "sample_size": [src.shape[1], src.shape[0]]
+                               if full is not None or not _state.get("realtime_full") else None,
             })
 
         # The exact frame the boxes were computed from, so the overlay always lines up.
@@ -3341,6 +3699,29 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/record_image":
             from urllib.parse import parse_qs
             return self._record_image((parse_qs(u.query).get("file") or [""])[0])
+
+        if u.path == "/api/recording":
+            if _recorder is None:
+                return self._json({"available": False})
+            return self._json(dict(_recorder.status(), available=True))
+
+        if u.path == "/api/recordings":
+            if _recorder is None:
+                return self._json({"available": False, "rows": []})
+            return self._json({"available": True, "dir": _recorder.out_dir,
+                               "rows": _recorder.recordings()})
+
+        if u.path.startswith("/recordings/"):
+            # Only names the recorder itself makes, from its own folder — never a path.
+            from recorder import NAME_RE
+            name = u.path[len("/recordings/"):]
+            if _recorder is None or not NAME_RE.match(name):
+                return self._err(404, "No such recording")
+            path = os.path.join(_recorder.out_dir, name)
+            if not os.path.isfile(path):
+                return self._err(404, "No such recording")
+            ctype = "video/x-matroska" if name.endswith(".mkv") else "application/x-ndjson"
+            return self._send_file(path, ctype, name)
 
         if u.path.startswith("/api/frame/"):
             fid = u.path.rsplit("/", 1)[-1]
@@ -3473,6 +3854,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._err(400, str(e))
             except Exception as e:
                 return self._err(500, f"Could not update the worker threshold: {e}")
+
+        if u.path == "/api/image_dwell":
+            try:
+                req = json.loads(body)
+            except Exception:
+                return self._err(400, "Body must be JSON")
+            try:
+                return self._json(set_image_dwell(req.get("seconds")))
+            except ValueError as e:
+                return self._err(400, str(e))
 
         if u.path == "/api/away_fraction":
             try:
@@ -3698,6 +4089,23 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._err(500, f"Could not update the RSSI threshold: {e}")
 
+        if u.path == "/api/recording":
+            if _recorder is None:
+                return self._err(409, "Recording needs the camera, which is off on this server")
+            try:
+                on = bool(json.loads(body).get("on"))
+            except Exception:
+                return self._err(400, "Body must be JSON")
+            from recorder import RecorderError
+            try:
+                out = _recorder.start(_recording_meta()) if on else _recorder.stop()
+            except RecorderError as e:
+                return self._err(409, str(e))
+            except Exception as e:
+                return self._err(500, f"Could not {'start' if on else 'stop'} recording: "
+                                      f"{type(e).__name__}: {e}")
+            return self._json(dict(out, available=True))
+
         if u.path == "/api/rfid_settings":
             if _rfid is None:
                 return self._err(409, "No RFID reader on this server")
@@ -3706,7 +4114,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 return self._err(400, "Body must be JSON")
             try:
-                out = set_rfid_settings(req.get("power_dbm"), req.get("rf_mode"))
+                out = set_rfid_settings(req.get("power_dbm"), req.get("rf_mode"),
+                                        req.get("antenna"))
             except ValueError as e:
                 return self._err(400, str(e))
             return self._json(out) if out.get("ok") else self._err(422, out.get("error", "refused"))
@@ -3848,6 +4257,17 @@ def default_rtsp() -> str:
     return "rtsp://user:password@192.168.1.105:554/?h26x=4&line=1&inst=1"
 
 
+def _antenna_list(text: str) -> list[int]:
+    """--rfid-antenna: "1" or "1,3" → [1, 3]. The MPK-R-9504 has ports 1-4."""
+    try:
+        ants = [int(a) for a in str(text).split(",") if a.strip()]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a port list: {text!r} (e.g. 1 or 1,3)")
+    if not ants or len(set(ants)) != len(ants) or not all(1 <= a <= 4 for a in ants):
+        raise argparse.ArgumentTypeError(f"ports must be distinct, 1-4: {text!r}")
+    return ants
+
+
 def main():
     ap = argparse.ArgumentParser(description="PPE gate kiosk (Phase 1)")
     ap.add_argument("--model", default="models/ppe.pt")
@@ -3879,7 +4299,10 @@ def main():
     ap.add_argument("--rfid-host", default=None,
                     help="MPK-R-9504 reader address; omitted means no RFID (the default)")
     ap.add_argument("--rfid-port", type=int, default=8888)
-    ap.add_argument("--rfid-antenna", type=int, default=1)
+    ap.add_argument("--rfid-antenna", type=_antenna_list, default=[1],
+                    help="antenna port(s) on the reader box: 1, or e.g. 1,3 — several take "
+                         "turns (RfidService.ANT_DWELL_S each) and a badge counts at its "
+                         "strongest on any of them")
     ap.add_argument("--rfid-power", type=float, default=20.0, help="dBm")
     ap.add_argument("--rfid-before", type=float, default=3.0,
                     help="seconds BEFORE the trigger to consider; the approach is the "
@@ -3917,7 +4340,12 @@ def main():
                          "at ~172 KB a sample that is ~300 MB/hour)")
     ap.add_argument("--realtime-max", type=int, default=5000,
                     help="most realtime samples kept before the oldest are deleted "
-                         "(default 5000, roughly 860 MB); 0 disables pruning")
+                         "(default 5000: ~860 MB at 1280x960, ~5.5 GB at the camera's "
+                         "native 5 MP); 0 disables pruning")
+    ap.add_argument("--realtime-gate-res", action="store_true",
+                    help="realtime detects and saves the gate's own --cap-width x "
+                         "--cap-height frame instead of opening a second, native-"
+                         "resolution camera stream while it runs")
     ap.add_argument("--no-record", action="store_true",
                     help="do not save triggered captures to the dataset")
     ap.add_argument("--max-model-mb", type=int, default=512,
@@ -3976,6 +4404,8 @@ def main():
     cfg.setdefault("track_person_conf", TRACK_PERSON_CONF_DEFAULT)
     cfg.setdefault("exit_area_fraction", EXIT_AREA_FRACTION_DEFAULT)
     cfg.setdefault("away_fraction", AWAY_FRACTION_DEFAULT)
+    cfg.setdefault("burst_before", BURST_BEFORE_DEFAULT)
+    cfg["image_dwell"] = _dwell_from(cfg, args.image_dwell)   # so the page can show it
 
     # The model the operator last switched to from the page wins over --model, which
     # is only the starting point for a config that has never seen a switch. It has to
@@ -4021,9 +4451,11 @@ def main():
         # (/api/sensor_trigger) arms it; the pin stays known so that toggle works.
         "sensor_enabled": False,
         "image_trigger_enabled": not args.no_image_trigger and not args.no_camera,
-        "image_dwell": max(0.0, args.image_dwell),
+        # gate.json (the page's 「停留」) over --image-dwell — see IMAGE_DWELL_RANGE.
+        "image_dwell": _dwell_from(cfg, args.image_dwell),
         "realtime_interval": max(0.0, args.realtime_interval),
         "realtime_max": max(0, args.realtime_max),
+        "realtime_full": not args.realtime_gate_res,
         "record_dir": os.path.realpath(
             args.record_dir or PKG_ROOT),
         "record_max": max(0, args.record_max),
@@ -4124,9 +4556,13 @@ def main():
         # command line, like the model does — the operator tunes them on site.
         _rfid = RfidService(args.rfid_host, args.rfid_port, antenna=args.rfid_antenna,
                             power_dbm=float(cfg.get("rfid_power_dbm", args.rfid_power)),
-                            rf_mode=int(cfg.get("rfid_rf_mode", RFID_MODE_DEFAULT)))
-        print(f"==> RFID transmit {_rfid.power_dbm:g} dBm, receive mode {_rfid.rf_mode} "
-              f"({RFID_MODES.get(_rfid.rf_mode, ('?', '?'))[0]})")
+                            rf_mode=int(cfg.get("rfid_rf_mode", RFID_MODE_DEFAULT)),
+                            antenna_settings=_antenna_settings_from(cfg))
+        print("==> RFID " + "; ".join(
+            f"antenna {a}: {s['power_dbm']:g} dBm, receive mode {s['rf_mode']} "
+            f"({RFID_MODES.get(s['rf_mode'], ('?', '?'))[0]})" for a, s in _rfid.settings().items())
+            + (f" — taking turns {RfidService.ANT_DWELL_S:g} s each"
+               if len(_rfid.antennas) > 1 else ""))
         if args.sensor_pin:
             _rfid.on_gpio_change = sensor_triggered
             print(f"==> Through-beam trigger on GPIO IN{args.sensor_pin} available "
@@ -4141,12 +4577,21 @@ def main():
         pipeline = build_camera_pipeline(args.rtsp, args.cap_width, args.cap_height,
                                          args.rtsp_protocol)
         threading.Thread(target=camera_loop, args=(pipeline,), daemon=True).start()
+        global _recorder
+        from recorder import Recorder
+        _recorder = Recorder(args.rtsp, os.path.join(_state["record_dir"], "recordings"),
+                             args.rtsp_protocol)
+        if _state["realtime_full"]:
+            # Opened on demand by the first realtime poll, never at startup.
+            _camera_full["pipeline"] = build_camera_pipeline(args.rtsp, 0, 0, args.rtsp_protocol)
+            print("==> Realtime samples at the camera's native resolution "
+                  "(second stream, open only while realtime runs)")
         threading.Thread(target=image_trigger_loop, name="ImageTrigger", daemon=True).start()
         zl, zr = cfg["trigger_zone"]
         print(f"==> Image trigger {'ON' if _state['image_trigger_enabled'] else 'off'}: "
               f"Person box >= {cfg['trigger_min_area']} px², centre within "
               f"{zl:.0%}..{zr:.0%} of frame width, for {_state['image_dwell']:g}s "
-              f"fires a check; one tag >= {cfg['rfid_min_rssi']:g} dBm required"
+              f"fires a check; the strongest badge >= {cfg['rfid_min_rssi']:g} dBm is the worker"
               + ("" if args.rfid_host else " (no reader: worker ID left blank)"))
 
     if _tower is not None:

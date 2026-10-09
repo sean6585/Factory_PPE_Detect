@@ -46,8 +46,29 @@ if _VENDOR not in sys.path:
     sys.path.insert(0, _VENDOR)
 
 
+# How a timed inventory run ends normally (OK, stop condition, timeout, abort). Anything
+# else — BUSY, ERR_ANTENNA_NOT_ENABLE, … — is the reader refusing, and restarts back off.
+NORMAL_END = (0x00, 0x01, 0x02, 0x03)
+
+
+def pick_worker(rows: list[dict], floor: float) -> tuple[dict | None, list[dict]]:
+    """The image trigger's identity rule (operator, 2026-10-07): of the badges whose peak
+    in the window reached `floor`, the STRONGEST is the worker. Returns (that row or
+    None, every row at or above the floor, strongest first).
+
+    It used to be "exactly one at or above the floor, else 檢測口請淨空". With two
+    antennas facing each other across the walkway, a second badge (the next worker in
+    line) is heard above the floor so often that the gate kept refusing; the operator
+    chose to take the strongest instead. The cost is a wrong name when two badges are
+    close in strength — every badge heard stays on the record (rfid_tags) for audit.
+    `rows` is summary()'s shape; a badge's rssi there is already its peak over every
+    antenna (the union)."""
+    near = sorted((r for r in rows if r["rssi"] >= floor), key=lambda r: -r["rssi"])
+    return (near[0] if near else None), near
+
+
 class TagObservations:
-    """Rolling per-EPC log of (monotonic time, rssi), trimmed to a horizon.
+    """Rolling per-EPC log of (monotonic time, rssi, antenna), trimmed to a horizon.
 
     Times are `time.monotonic()`, deliberately not the reader's own DF_TIMESTAMP and not
     wall clock. The reader's clock is a different box needing sync nobody wants to
@@ -62,12 +83,13 @@ class TagObservations:
         self._lock = threading.Lock()
         self.total_reads = 0
 
-    def add(self, epc: str, rssi: float, t: float | None = None) -> None:
-        """Called from the reader's RX thread — keep this cheap."""
+    def add(self, epc: str, rssi: float, t: float | None = None, ant: int = 0) -> None:
+        """Called from the reader's RX thread — keep this cheap. `ant` is the antenna
+        port the reader says heard it (0 = unknown)."""
         t = time.monotonic() if t is None else t
         with self._lock:
             self.total_reads += 1
-            self._obs[epc].append((t, rssi))
+            self._obs[epc].append((t, rssi, ant))
             cutoff = t - self.horizon_s
             for e in list(self._obs):
                 q = self._obs[e]
@@ -79,9 +101,19 @@ class TagObservations:
     def window(self, t0: float, before: float, after: float) -> dict[str, list]:
         lo, hi = t0 - before, t0 + after
         with self._lock:
-            return {e: [(t, r) for (t, r) in q if lo <= t <= hi]
+            return {e: [o for o in q if lo <= o[0] <= hi]
                     for e, q in self._obs.items()
-                    if any(lo <= t <= hi for (t, _) in q)}
+                    if any(lo <= o[0] <= hi for o in q)}
+
+    @staticmethod
+    def _ant_peaks(obs) -> dict[int, float]:
+        """Peak dBm per antenna port — kept so two antennas can be compared and
+        calibrated; the decision itself uses the peak over all of them."""
+        peaks: dict[int, float] = {}
+        for (_, r, a) in obs:
+            if a and r > peaks.get(a, float("-inf")):
+                peaks[a] = r
+        return {a: round(p, 1) for a, p in sorted(peaks.items())}
 
     def summary(self, t0: float | None = None, before: float | None = None) -> list[dict]:
         """Every EPC heard in [t0-before, t0] (default: the whole horizon), one row each:
@@ -97,16 +129,17 @@ class TagObservations:
         rows = []
         with self._lock:
             for epc, q in self._obs.items():
-                obs = [(t, r) for (t, r) in q if lo <= t <= t0]
+                obs = [o for o in q if lo <= o[0] <= t0]
                 if not obs:
                     continue
                 rows.append({
                     "epc": epc,
-                    "rssi": round(max(r for (_, r) in obs), 1),
+                    "rssi": round(max(o[1] for o in obs), 1),     # peak over every antenna
                     "last_rssi": round(obs[-1][1], 1),
                     "reads": len(obs),
                     "first_t": obs[0][0],
                     "last_t": obs[-1][0],
+                    "ants": self._ant_peaks(obs),
                 })
         rows.sort(key=lambda d: -d["rssi"])
         return rows
@@ -124,13 +157,14 @@ class TagObservations:
             return None
         ranked = []
         for epc, obs in w.items():
-            peak = max(r for (_, r) in obs)
+            peak = max(o[1] for o in obs)
             ranked.append({
                 "epc": epc,
                 "rssi": round(peak, 1),
                 "reads": len(obs),
-                "first_seen": round(min(t for (t, _) in obs) - t0, 2),  # relative to T
-                "last_seen": round(max(t for (t, _) in obs) - t0, 2),
+                "first_seen": round(min(o[0] for o in obs) - t0, 2),  # relative to T
+                "last_seen": round(max(o[0] for o in obs) - t0, 2),
+                "ants": self._ant_peaks(obs),
             })
         ranked.sort(key=lambda d: -d["rssi"])
         best = dict(ranked[0])
@@ -185,11 +219,26 @@ class RfidService:
     # purpose: the box pushes changes in real time on its own, this only covers a
     # dropped packet or a pin that never changed since connect.
     GPIO_POLL_S = 5.0
+    # Several antennas take turns, this long each. The run command (0x6D) names ONE
+    # antenna port, so two antennas cannot inventory at once: each gets a timed run and
+    # the next starts the moment it ends (measured on the real box 2026-10-07: no gap
+    # between runs). Short, so a worker walking past is seen by both within a second.
+    ANT_DWELL_S = 0.25
 
-    def __init__(self, host: str, port: int, antenna: int = 1,
-                 power_dbm: float = 20.0, rf_mode: int = 103, horizon_s: float = 30.0):
+    def __init__(self, host: str, port: int, antenna: int | list[int] = 1,
+                 power_dbm: float = 20.0, rf_mode: int = 103, horizon_s: float = 30.0,
+                 antenna_settings: dict | None = None):
         self.host, self.port = host, port
-        self.antenna, self.power_dbm, self.rf_mode = antenna, power_dbm, rf_mode
+        # One antenna = continuous inventory, exactly as before; several = turns.
+        self.antennas = [antenna] if isinstance(antenna, int) else list(antenna)
+        self._ant_i = 0
+        # Transmit power and receive mode PER ANTENNA (2026-10-07): every run command
+        # carries both, so each antenna's turn can use its own — two antennas facing each
+        # other across the walkway need not be equally loud. `antenna_settings` is
+        # {port: (power_dbm, rf_mode)}; a port missing from it gets power_dbm / rf_mode.
+        given = antenna_settings or {}
+        self.ant_set = {a: tuple(given.get(a, (power_dbm, rf_mode))) for a in self.antennas}
+        self.power_dbm, self.rf_mode = self.ant_set[self.antennas[0]]   # the first, for status
         self.obs = TagObservations(horizon_s)
         self.gpio = GpioSensor()
         self.connected = False
@@ -199,7 +248,7 @@ class RfidService:
         self._reconfig_lock = threading.Lock()
         self._reconfig = threading.Event()
         self._reconfig_done = threading.Event()
-        self._reconfig_want = (power_dbm, rf_mode)
+        self._reconfig_want = (power_dbm, rf_mode, None)
         self._reconfig_result: dict | None = None
         self._finish_status: int | None = None
         self._stop = threading.Event()
@@ -217,6 +266,28 @@ class RfidService:
         # _on_inventory_finished; the poll loop below reissues 0x6D when it goes False.
         self._inventory_running = False
         self._last_end_status: int | None = None
+        # Wakes the supervisor the moment a run ends — with antennas taking turns every
+        # 0.25 s, its 0.25 s poll would otherwise leave each one idle half the time.
+        self._ended = threading.Event()
+        self._end_seq = 0
+
+    def _start(self, reader, ant: int | None = None, power: float | None = None,
+               mode: int | None = None) -> None:
+        """Start the next inventory run, at that antenna's own power and mode: continuous
+        on a single antenna; with several, a timed ANT_DWELL_S run on the next one in
+        turn. `ant` (and power/mode) override the turn — reconfigure() trying a value."""
+        if ant is None:
+            ant = self.antennas[self._ant_i % len(self.antennas)]
+            self._ant_i += 1
+        p, m = self.ant_set[ant]
+        power = p if power is None else power
+        mode = m if mode is None else mode
+        if len(self.antennas) == 1:
+            reader.start_inventory(antenna=ant, rf_mode=mode, power_dbm=power)
+        else:
+            reader.start_inventory(antenna=ant, rf_mode=mode, power_dbm=power,
+                                   time_ms=int(self.ANT_DWELL_S * 1000))
+        self._inventory_running = True
 
     def _on_tag(self, tag) -> None:
         """Runs on the vendor library's RX thread. Only appends — anything slower here
@@ -228,7 +299,7 @@ class RfidService:
         silently on every single read.
         """
         try:
-            self.obs.add(tag.epc_hex, tag.rssi_dbm)
+            self.obs.add(tag.epc_hex, tag.rssi_dbm, ant=tag.antenna_id)
         except Exception as e:
             # Never swallow this quietly: a mistake here means the reader looks connected
             # and healthy while recording nothing at all.
@@ -266,18 +337,26 @@ class RfidService:
             except Exception as e:
                 print(f"[rfid] on_gpio_change handler failed: {e}", flush=True)
 
-    def reconfigure(self, power_dbm: float, rf_mode: int, timeout: float = 10.0) -> dict:
-        """Change transmit power (dBm) and receive mode live, without a reconnect.
+    def settings(self) -> dict[int, dict]:
+        """{port: {"power_dbm", "rf_mode"}} for every antenna in use."""
+        return {a: {"power_dbm": p, "rf_mode": m} for a, (p, m) in self.ant_set.items()}
 
-        Returns {"ok", "power_dbm", "rf_mode", "error"?}. The reader validates both: an
-        out-of-range value is refused (ERR_PARAMETER_RF_POWER / _RF_MODE) and the previous
-        settings are put back, so reading never stops. Not connected: the values are
-        kept and used at the next connect."""
-        want = (float(power_dbm), int(rf_mode))
+    def reconfigure(self, power_dbm: float, rf_mode: int, antenna: int | None = None,
+                    timeout: float = 10.0) -> dict:
+        """Change transmit power (dBm) and receive mode live, without a reconnect — for
+        one antenna, or (antenna=None) for every one of them.
+
+        Returns {"ok", "power_dbm", "rf_mode", "antenna", "error"?}. The reader validates
+        both: an out-of-range value is refused (ERR_PARAMETER_RF_POWER / _RF_MODE) and the
+        previous settings are put back, so reading never stops. Not connected: the values
+        are kept and used at the next connect."""
+        want = (float(power_dbm), int(rf_mode), antenna)
+        if antenna is not None and antenna not in self.ant_set:
+            raise ValueError(f"antenna {antenna} is not in use (in use: {self.antennas})")
         with self._reconfig_lock:
             if not self.connected:
-                self.power_dbm, self.rf_mode = want
-                return {"ok": True, "power_dbm": want[0], "rf_mode": want[1],
+                self._set(*want)
+                return {"ok": True, "power_dbm": want[0], "rf_mode": want[1], "antenna": antenna,
                         "note": "reader not connected — used at the next connect"}
             self._reconfig_want = want
             self._reconfig_result = None
@@ -285,18 +364,25 @@ class RfidService:
             self._reconfig.set()
             if not self._reconfig_done.wait(timeout):
                 return {"ok": False, "error": "the reader did not answer in time",
-                        "power_dbm": self.power_dbm, "rf_mode": self.rf_mode}
+                        "power_dbm": self.power_dbm, "rf_mode": self.rf_mode, "antenna": antenna}
             return self._reconfig_result
 
-    def _apply_reconfig(self, reader) -> dict:
-        """On the supervisor thread: stop inventory, set the mode, start at the new power,
-        and watch for a refusal — it arrives as an "inventory ended" with an error status,
-        because the run command itself is not acknowledged."""
-        from mpk_rfid import status_text
-        prev = (self.power_dbm, self.rf_mode)
-        want = self._reconfig_want
+    def _set(self, power: float, mode: int, antenna: int | None) -> None:
+        for a in (self.antennas if antenna is None else [antenna]):
+            self.ant_set[a] = (power, mode)
+        self.power_dbm, self.rf_mode = self.ant_set[self.antennas[0]]
 
-        def run(power, mode):
+    def _apply_reconfig(self, reader) -> dict:
+        """On the supervisor thread: stop inventory, set the mode, start a run at the new
+        values on each antenna being changed, and watch for a refusal — it arrives as an
+        "inventory ended" with an error status, because the run command itself is not
+        acknowledged. A refused antenna gets its previous values back."""
+        from mpk_rfid import status_text
+        power, mode, antenna = self._reconfig_want
+        targets = self.antennas if antenna is None else [antenna]
+        prev = dict(self.ant_set)
+
+        def run(ant, power, mode):
             try:
                 reader.abort()                   # the reader sends "ended" before the ack
             except Exception:
@@ -305,27 +391,33 @@ class RfidService:
             time.sleep(0.2)
             reader.set_inventory_parameter(rf_mode=mode)
             self._finish_status = None
-            reader.start_inventory(antenna=self.antenna, rf_mode=mode, power_dbm=power)
-            self._inventory_running = True
+            self._start(reader, ant, power, mode)
             time.sleep(1.0)
+            # A timed run (several antennas) ends normally within that second, so only
+            # an error status is a refusal.
             st = self._finish_status
-            if st is not None and st != 0:
+            if st is not None and st not in NORMAL_END:
                 self._inventory_running = False
                 raise RuntimeError(f"reader refused it: {status_text(st)} (0x{st:02X})")
 
         try:
-            run(*want)
-            self.power_dbm, self.rf_mode = want
-            print(f"[rfid] now {want[0]:g} dBm, RF mode {want[1]}", flush=True)
-            return {"ok": True, "power_dbm": want[0], "rf_mode": want[1]}
+            for a in targets:
+                run(a, power, mode)
+            self._set(power, mode, antenna)
+            where = "every antenna" if antenna is None else f"antenna {antenna}"
+            print(f"[rfid] {where} now {power:g} dBm, RF mode {mode}", flush=True)
+            return {"ok": True, "power_dbm": power, "rf_mode": mode, "antenna": antenna}
         except Exception as e:
             err = str(e)
+            self.ant_set = prev
             try:
-                run(*prev)
+                for a in targets:
+                    run(a, *prev[a])
             except Exception as e2:
-                err += f"; restoring {prev[0]:g} dBm / mode {prev[1]} failed too: {e2}"
-            print(f"[rfid] {want[0]:g} dBm / mode {want[1]} not applied: {err}", flush=True)
-            return {"ok": False, "error": err, "power_dbm": self.power_dbm, "rf_mode": self.rf_mode}
+                err += f"; restoring the previous settings failed too: {e2}"
+            print(f"[rfid] {power:g} dBm / mode {mode} not applied: {err}", flush=True)
+            return {"ok": False, "error": err, "power_dbm": self.power_dbm,
+                    "rf_mode": self.rf_mode, "antenna": antenna}
 
     def _on_inventory_finished(self, status: int, total: int, elapsed_ms: int) -> None:
         """Runs on the RX thread. Records only — MUST NOT call start_inventory() here.
@@ -335,11 +427,19 @@ class RfidService:
         that same lock to restart, the two would deadlock. The actual restart happens
         from the supervisor loop below, polling _inventory_running instead.
         """
-        self._inventory_running = False
-        self._finish_status = status
-        if status != self._last_end_status:
+        # Timed runs (several antennas) end every ANT_DWELL_S by design: only an
+        # abnormal end is news then.
+        if status != self._last_end_status and (len(self.antennas) == 1
+                                                 or status not in NORMAL_END):
             print(f"[rfid] inventory ended (status=0x{status:02X}) — restarting", flush=True)
+        # The end is recorded BEFORE the run is marked stopped: the supervisor reads the
+        # flag first and the status after, and must never see "stopped" with the
+        # previous run's status (an error end would then restart without backing off).
+        self._finish_status = status
         self._last_end_status = status
+        self._end_seq += 1
+        self._inventory_running = False
+        self._ended.set()
 
     def _loop(self) -> None:
         from mpk_rfid import DF_DEFAULT, RfidReader
@@ -371,18 +471,20 @@ class RfidService:
                 # usable. Commands must not be sent DURING inventory (STATUS_BUSY), so
                 # they belong here, before start_inventory.
                 reader.set_data_format(DF_DEFAULT)
+                # The mode here is only the reader's default: each run command carries
+                # its own antenna's mode, and that is the one the run uses.
                 reader.set_inventory_parameter(rf_mode=self.rf_mode)
-                reader.start_inventory(antenna=self.antenna, rf_mode=self.rf_mode,
-                                       power_dbm=self.power_dbm)
-                self._inventory_running = True
+                self._start(reader)
 
-                gpio_backoff = 0.0
+                inv_backoff = 0.0
                 next_gpio_poll = time.monotonic()
                 inv_restart_at = 0.0
+                seen_end = self._end_seq
                 # is_open is a PROPERTY on RfidReader, not a method — calling it raises
                 # "'bool' object is not callable" and the supervisor then reconnects in a
                 # tight loop while reading nothing.
                 while not self._stop.is_set() and reader.is_open:
+                    self._ended.clear()       # before reading the flags below; see _ended
                     if self._reconfig.is_set():
                         self._reconfig.clear()
                         self._reconfig_result = self._apply_reconfig(reader)
@@ -403,18 +505,25 @@ class RfidService:
                     # rfid_console.py's _maybe_restart(): a short backoff on repeated
                     # failure so a persistently broken command channel doesn't get
                     # hammered, reset the moment a restart actually succeeds.
+                    # A run that ENDED with an error (BUSY, antenna not enabled, …) backs
+                    # off the same way: the run command is not acknowledged, so its
+                    # refusal arrives as an end, and an immediate restart would loop on it.
+                    if not self._inventory_running and self._end_seq != seen_end:
+                        seen_end = self._end_seq
+                        if self._last_end_status in NORMAL_END:
+                            inv_backoff = 0.0
+                        else:
+                            inv_backoff = min(2.0, inv_backoff * 2 or 0.1)
+                            inv_restart_at = now + inv_backoff
                     if not self._inventory_running and now >= inv_restart_at:
                         try:
-                            reader.start_inventory(antenna=self.antenna, rf_mode=self.rf_mode,
-                                                    power_dbm=self.power_dbm)
-                            self._inventory_running = True
-                            gpio_backoff = 0.0
+                            self._start(reader)
                         except Exception as e:
                             print(f"[rfid] inventory restart failed: {e}", flush=True)
-                            gpio_backoff = min(2.0, gpio_backoff * 2 or 0.1)
-                            inv_restart_at = now + gpio_backoff
+                            inv_backoff = min(2.0, inv_backoff * 2 or 0.1)
+                            inv_restart_at = now + inv_backoff
 
-                    time.sleep(0.25)
+                    self._ended.wait(0.25)
             except Exception as e:
                 self.last_error = str(e)
                 print(f"[rfid] {e}; retrying in 3s", flush=True)
@@ -444,5 +553,7 @@ class RfidService:
 
     def status(self) -> dict:
         return {"host": self.host, "port": self.port, "connected": self.connected,
+                "antennas": self.antennas,
+                "antenna_settings": self.settings(),
                 "total_reads": self.obs.total_reads, "error": self.last_error,
                 "gpio": self.gpio.snapshot(), "gpio_at": self.gpio.updated_at}

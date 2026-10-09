@@ -19,6 +19,8 @@
   <button id="demoBtn" title="Full-screen view for visitors: the camera, each item OK / NG, the badge and the alarm. Everything here keeps running underneath.">&#128250; 大字報</button>
   <button id="rtBtn" title="Continuous detection; harvests training frames while it runs">&#9673; Realtime: off</button>
   <span class="tag" id="rtInfo"></span>
+  <button id="vidBtn" disabled title="Record the camera as it arrives (native 5 MP, every frame) plus a log of what the gate saw and decided every 0.1 s — for replaying a real day at the gate against new code or a new model. Stops by itself after an hour, or when the disk runs low.">&#9679; 錄影</button>
+  <button id="vidListBtn" title="Recordings on this gate: the video (.mkv, plays in VLC) and its log (.jsonl)">錄影檔</button>
   <span style="width:14px"></span>
   <button id="pick">Choose image(s)&hellip;</button>
   <input type="file" id="file" accept="image/*" multiple hidden>
@@ -37,9 +39,9 @@
   <input type="range" id="areaSlider" min="0" max="1228800" step="100" value="10000">
   <span id="areaMax" class="areaNum"></span>
   <span class="tag">px&sup2;</span>
-  <label class="tag" for="exitFrac" title="A worker coming out of the door is side-on, so their box is smaller. A track that came from the door's side starts its 出場 visit at this fraction of the area threshold; everyone else needs the full threshold. Saved in gate.json.">出場（門那側來）&times;</label>
-  <input type="number" id="exitFrac" class="areaInput" min="0.2" max="1" step="0.05" value="0.60"
-         title="0.2 – 1.0 · Enter or click away to save">
+  <label class="tag" for="exitFrac" title="For a track that came from the door's side (出場). Under 1: their visit starts at this fraction of the area threshold — a worker stepping out sideways has a smaller box — and the check still needs the full threshold. Over 1: they must be this much BIGGER than the threshold both to be followed and to be checked — a worker leaving comes out by the door near the camera and walks away, box big to small. Everyone else needs the plain threshold. Saved in gate.json.">出場（門那側來）&times;</label>
+  <input type="number" id="exitFrac" class="areaInput" min="0.2" max="2" step="0.05" value="0.60"
+         title="0.2 – 2.0 · Enter or click away to save">
   <span class="tag" id="exitFracPx">&hellip;</span>
   <label class="tag" for="awayFrac" title="A visit's box shrinking below this fraction of the area threshold (held 0.3 s) counts as walking away from the camera: the way out for 出場, turning back for 進場. Higher = reported sooner, but above ~0.7 a worker turning side-on to the door (box ~55-65 % of front-on) may read as walking away. 0.5 suits a long approach path. Saved in gate.json.">走遠線 &times;</label>
   <input type="number" id="awayFrac" class="areaInput" min="0.3" max="0.8" step="0.05" value="0.50"
@@ -56,7 +58,7 @@
 </div>
 
 <div id="rssiBar">
-  <span class="tag" title="Image trigger: only tags at least this strong count as a person AT the gate. Exactly one such tag = one worker, the check runs. None = RFID_fail.mp3. Two or more = multi-person-detected.mp3 and the gate waits.">RFID one-person threshold &mdash; a tag must be at least this strong to count</span>
+  <span class="tag" title="Image trigger: only badges at least this strong (on either antenna) count as AT the gate. The strongest of them is the worker and the check runs; none = 「ID讀取失敗」. Since 2026-10-07 two or more no longer refuse.">RFID threshold &mdash; a badge must be at least this strong to count; the strongest is the worker</span>
   <span id="rssiVal" class="areaNum">&minus;60</span>
   <input type="range" id="rssiSlider" min="-100" max="0" step="1" value="-60">
   <span class="tag">dBm</span>
@@ -93,7 +95,12 @@
       <select id="doorSide">
         <option value="left">&#9664; 左</option>
         <option value="right">右 &#9654;</option>
+        <option value="both">&#9664; 左 &amp; 右 &#9654;</option>
       </select>
+      <label class="tag dirLabel" for="dwellSec" title="How long one person must stand in the door zone before the check runs. Shorter = faster, but a worker still stepping into place gets judged mid-step; the badge window also looks back 3 s from this moment. Saved in gate.json.">停留</label>
+      <input type="number" id="dwellSec" class="areaInput" min="0.3" max="5" step="0.1" value="1.2"
+             title="0.3 – 5 s · Enter or click away to save">
+      <span class="tag">秒</span>
     </div>
     <div id="liveToggleBar">
       <button id="liveToggle">&#9208; Pause live view</button>
@@ -225,6 +232,25 @@
   </div>
 </div>
 
+<div id="vidModal">
+  <div class="sheet wide">
+    <div class="sheetHead">
+      <div>
+        <h3>錄影檔</h3>
+        <div class="sub" id="vidSub"></div>
+      </div>
+      <button id="vidClose">Close</button>
+    </div>
+    <div class="recWrap">
+      <table class="recTable">
+        <thead><tr><th>開始時間</th><th>長度</th><th>大小</th><th>影片</th><th>判斷紀錄</th></tr></thead>
+        <tbody id="vidBody"></tbody>
+      </table>
+    </div>
+    <div id="vidErr" style="color:var(--ng);font-size:14px;margin-top:8px"></div>
+  </div>
+</div>
+
 <div id="rfidModal">
   <div class="sheet wide">
     <div class="sheetHead">
@@ -239,15 +265,8 @@
       <label class="tag chk"><input type="checkbox" id="rfidAuto" checked> auto-refresh</label>
       <span class="tag" id="rfidCount"></span>
     </div>
-    <div class="sheetActions rfidSet" title="Stronger transmit power reaches badges further away; a more sensitive receive mode hears fainter ones. Both also pick up bystanders' badges further off — raise the one-person threshold (dBm slider) if 「兩張卡」 refusals start. Applied live and saved; the reader refuses values it does not support and keeps the old ones.">
-      <label for="rfidPower">發射功率</label>
-      <input type="number" id="rfidPower" min="5" max="33" step="0.5">
-      <span>dBm</span>
-      <label for="rfidMode">接收模式</label>
-      <select id="rfidMode"></select>
-      <button id="rfidApply">套用</button>
-      <span class="tag" id="rfidSetState"></span>
-    </div>
+    <!-- One row per antenna in use, built by loadRfidSettings() (web/app.js). -->
+    <div id="rfidSets" title="Stronger transmit power reaches badges further away; a more sensitive receive mode hears fainter ones. Both also reach badges further off — the strongest badge above the threshold is taken as the worker, so the next person in line must stay below it. Each antenna is set on its own, applied live and saved; the reader refuses values it does not support and that antenna keeps its old ones."></div>
     <div class="recWrap">
       <table class="recTable">
         <thead><tr>

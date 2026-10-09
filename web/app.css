@@ -76,6 +76,7 @@
      silent upload failure is exactly what this tag exists to make visible. */
   #itRep{font-family:ui-monospace,Menlo,monospace}
   #itEnable.on{border-color:var(--ok)!important;color:var(--ok);font-weight:700}
+  #itEnable.arming{border-color:var(--warn,#e6a100)!important;background:#fff4d6;color:#8a5a00;font-weight:700}
   #itRep.bad{color:var(--ng);font-weight:700}
   #itRep.good{color:var(--ok)}
 
@@ -122,6 +123,7 @@
             font-weight:700;color:#fff;background:rgba(185,28,28,.8);white-space:nowrap}
   .doorMark.left{left:8px}
   .doorMark.right{right:8px}
+  .doorMark.both{left:50%;transform:translateX(-50%);white-space:nowrap}
 
   /* Door-zone bar under the picture: one track, two handles ( ----I--------I---- ).
      Not native <input type=range>: two of those can't share a track without one
@@ -283,6 +285,8 @@
   table.recTable td.num{font-family:ui-monospace,Menlo,monospace;text-align:right}
   table.recTable td.epc{font-family:ui-monospace,Menlo,monospace}
   #rtBtn.on{border-color:var(--ng)!important;color:var(--ng);font-weight:700}
+  #vidBtn{font-variant-numeric:tabular-nums}
+  #vidBtn.on{border-color:var(--ng)!important;background:var(--ng);color:#fff;font-weight:700}
   #rtInfo{display:none}
   #rtInfo.on{display:inline-block}
   .sheet.wide{width:min(1150px,95vw)}
@@ -319,9 +323,9 @@
             align-items:center;justify-content:center;z-index:30;cursor:zoom-out;padding:24px}
   #lightbox.on{display:flex}
   #lightbox img{max-width:100%;max-height:100%;border-radius:6px;box-shadow:0 12px 40px rgba(0,0,0,.5)}
-  #modelModal, #recordsModal, #rfidModal, #towerModal{position:fixed;inset:0;background:rgba(20,20,20,.45);
+  #modelModal, #recordsModal, #rfidModal, #towerModal, #vidModal{position:fixed;inset:0;background:rgba(20,20,20,.45);
                              display:none;align-items:center;justify-content:center;z-index:20}
-  #modelModal.on, #recordsModal.on, #rfidModal.on, #towerModal.on{display:flex}
+  #modelModal.on, #recordsModal.on, #rfidModal.on, #towerModal.on, #vidModal.on{display:flex}
   .sheet{background:#fff;border-radius:14px;padding:22px 24px;width:min(720px,92vw);
          max-height:82vh;overflow:auto;box-shadow:0 18px 50px rgba(0,0,0,.25)}
   .sheetHead{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
@@ -391,6 +395,9 @@
   @keyframes lampBlink{to{opacity:.35}}
   .pill.unreg{background:#fde8e6;color:#c62828}
   .rfidSet{font-size:14px}
+  #rfidSets .rfidSet{margin-bottom:8px}
+  #rfidSets .rfidSet:last-child{margin-bottom:18px}
+  .rfidAnt{font-weight:700}
   .rfidSet input[type=number]{min-width:0;flex:0 0 80px}
   .rfidSet select{border:1px solid var(--line);border-radius:8px;padding:7px 9px;font-size:14px}
   #towerVol{flex:1 1 220px;accent-color:var(--accent)}

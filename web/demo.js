@@ -58,6 +58,27 @@
     rendered = JSON.stringify(labels);
   }
 
+  // The trigger's event (a check starting, a refusal) as one key: when it differs from
+  // the event that was current when the held result arrived, the result is someone
+  // earlier's. The outcome is left out — a PASS's event changes to pass_entry/pass_leave
+  // in place when IT answers, and that is still the same check.
+  const evKey = ev => ev ? `${ev.t}|${(ev.epcs || []).join(",")}` : "";
+  let resultEv = "";            // evKey of the event current when `result` arrived
+  let droppedFrame = null;      // frame_id of a result a newer event superseded
+  function activeEvent(){
+    const s = alarm.s || {};
+    return s.alarm_active ? s.last_event : null;
+  }
+  // True while a newer event than the held result is on: a new worker's check is
+  // running, or they were refused. Their badges and ID must not be the last worker's.
+  function resultIsStale(){
+    const ev = activeEvent();
+    if (!result || !ev || evKey(ev) === resultEv) return false;
+    // A result stamped a later second than the event is newer than it, whatever order
+    // the two polls brought them in.
+    return !(result.ts && ev.t && result.ts > ev.t);
+  }
+
   function paintItems(){
     const labels = items();
     if (JSON.stringify(labels) !== rendered) buildRows(labels);   // config arrived / changed
@@ -122,13 +143,16 @@
     itTimer = setTimeout(itTick, result ? 500 : 2000);
   }
 
-  // The badge of the check on screen; failing that, the badge(s) the alarm is about
-  // (an unregistered badge, two badges at once).
+  // ONE badge: the strongest — the one the gate took as the worker. The server lists
+  // every badge above the floor, strongest first (epcs[0]), since two or more no longer
+  // refuse (2026-10-07); joining them showed several IDs. A newer event than the held
+  // result wins at once: its badge is decided the moment the dwell completes, before the
+  // burst, and the held result may be the previous worker's (2026-10-08: the screen kept
+  // the last worker's ID through the next check, and through a 「ID讀取失敗」 for good).
   function tagText(){
-    if (result && result.worker_id) return result.worker_id;
-    const ev = alarm.s && alarm.s.alarm_active ? alarm.s.last_event : null;
-    if (alarm.key && ev && ev.epcs && ev.epcs.length) return ev.epcs.join(" / ");
-    return "—";
+    const ev = activeEvent();
+    if (result && result.worker_id && result.worker_id !== "—") return result.worker_id;
+    return ev && ev.epcs && ev.epcs.length ? ev.epcs[0] : "—";
   }
 
   function paintBanner(){
@@ -163,12 +187,19 @@
 
   // ── hooks the developer page calls ──────────────────────────────────────────
   window.demoResult = res => {
+    // The developer page re-renders its panel (a threshold, a class dropdown) with the
+    // result it holds; one this screen already dropped as the previous worker's stays out.
+    if (res && res.frame_id && res.frame_id === droppedFrame) return;
     result = res || null;
+    resultEv = evKey(activeEvent());
     itCheck = (res && res.it_state) || null;
     if (window.DEMO_ON){ paintItems(); paintBanner(); }
   };
   window.demoAlarm = (key, s, pending) => {
     alarm = {key: key || null, s: s || null, pending: !!pending};
+    // A newer event supersedes the held result for good — dropped, not just hidden, so it
+    // cannot come back when that event's announcement ends.
+    if (resultIsStale()){ droppedFrame = result.frame_id || null; result = null; itCheck = null; }
     if (window.DEMO_ON){ paintBanner(); paintItems(); paintBoxes(); }
   };
 
@@ -210,15 +241,19 @@
       g.fillRect(x - 6 * k, 0, 12 * k, 12 * k);
     }
     g.setLineDash([]);
-    const left = s.door_side !== "right";
-    const text = left ? "◀ 門 · 管制區" : "門 · 管制區 ▶";
+    // One label per door side: "both" (2026-10-09) marks the two.
+    const sides = s.door_side === "both" ? ["left", "right"] : [s.door_side === "right" ? "right" : "left"];
     g.font = `700 ${Math.round(14 * k)}px "Noto Sans TC","Noto Sans CJK TC",sans-serif`;
-    const tw = g.measureText(text).width + 16 * k, th = 24 * k, pad = 8 * k;
-    const x = left ? pad : W - pad - tw;
-    g.fillStyle = "rgba(185,28,28,.85)";
-    g.fillRect(x, pad, tw, th);
-    g.fillStyle = "#fff"; g.textBaseline = "middle";
-    g.fillText(text, x + 8 * k, pad + th / 2);
+    for (const side of sides){
+      const left = side === "left";
+      const text = left ? "◀ 門 · 管制區" : "門 · 管制區 ▶";
+      const tw = g.measureText(text).width + 16 * k, th = 24 * k, pad = 8 * k;
+      const x = left ? pad : W - pad - tw;
+      g.fillStyle = "rgba(185,28,28,.85)";
+      g.fillRect(x, pad, tw, th);
+      g.fillStyle = "#fff"; g.textBaseline = "middle";
+      g.fillText(text, x + 8 * k, pad + th / 2);
+    }
     g.restore();
   }
 

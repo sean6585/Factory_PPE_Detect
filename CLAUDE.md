@@ -25,8 +25,8 @@ never leave it in a state where a check silently passes when it should fail.
 run_gate_native.sh   preflight (torch/torchvision ABI, CUDA) → picks .engine over .pt
   └→ scripts/gate_server.py        one process, several threads:
        ├─ camera thread    RTSP → newest-frame buffer (latest wins, never a backlog)
-       ├─ image trigger    detects that buffer continuously; dwell → RFID one-person
-       │                   rule → run_gate_check()   (the default trigger)
+       ├─ image trigger    detects that buffer continuously; dwell → RFID strongest-
+       │                   badge rule → run_gate_check()   (the default trigger)
        ├─ RFID thread      scripts/rfid_reader.py: tag RSSI log + the sensor's GPIO
        ├─ recorder thread  writes captures.csv + dataset/{images,labels}
        ├─ audio thread     gst-launch-1.0 playbin, one clip at a time
@@ -46,7 +46,7 @@ run_gate_native.sh   preflight (torch/torchvision ABI, CUDA) → picks .engine o
 | What | Where | Notes |
 |---|---|---|
 | Checklist: items, class mappings, thresholds | `config/gate.json` | **written at runtime by the UI** |
-| Image-trigger area (px²) + RFID one-person RSSI floor (dBm) + RFID transmit power / receive mode + door side of the image + tracking person score + exit area fraction + walk-away line | `config/gate.json` (`trigger_min_area`, `rfid_min_rssi`, `rfid_power_dbm`, `rfid_rf_mode`, `door_side`, `track_person_conf`, `exit_area_fraction`, `away_fraction`) | same file, same UI-written caveat; defaults live in `gate_server.py`, not `DEFAULT_CONFIG` |
+| Image-trigger area (px²) + RFID one-person RSSI floor (dBm) + RFID transmit power / receive mode per antenna + door side of the image + tracking person score + exit area fraction + walk-away line | `config/gate.json` (`trigger_min_area`, `rfid_min_rssi`, `rfid_antenna_settings` — `{"1": {"power_dbm", "rf_mode"}, …}`, with `rfid_power_dbm` / `rfid_rf_mode` kept as antenna 1's and as the fallback, `door_side`, `track_person_conf`, `exit_area_fraction`, `away_fraction`, `image_dwell` — the page's 「停留」 seconds, 0.3–5, wins over `--image-dwell` like `model` does; `burst_before` — how many of the check's `frames` come from the dwell, default 3, hand-edited) | same file, same UI-written caveat; defaults live in `gate_server.py`, not `DEFAULT_CONFIG` |
 | Trigger on/off (image, sensor) | `_state` only | resets on restart: image ON, sensor OFF |
 | Camera RTSP URL + password | `config/camera.local.json` | gitignored, never commit |
 | Tower web login (for speaker volume) | `config/tower.local.json` (`web_user`, `web_pass`) | same rule as the camera file: never commit, never echo. The volume itself lives on the tower (0-15), set from the Speaker test slider through its web UI — one web login at a time, so a browser logged into the tower blocks it. The unit's **Mute** box (same page, 「靜音」 checkbox in the popup) silences every voice while `/api/status` still reports the channel playing — the gate cannot see it; check it first when the speaker is silent (2026-10-03) |
@@ -60,6 +60,7 @@ run_gate_native.sh   preflight (torch/torchvision ABI, CUDA) → picks .engine o
 | IT mock receiver | `scripts/it_mock.py` (port 8900, page at `/`), data in `it_mock_data/` | replies like the real service: `201 {"id", "access_type": "entry"/"leave", "message"}`; modes toggle/entry/leave/500/400/timeout from its page. Test data with worker photos — not a deliverable. Started by hand (`setsid nohup python3 scripts/it_mock.py &`), not a service |
 | IT sender progress | `events.sent` (byte offset), `events.rejected.jsonl` (HTTP 4xx, set aside) | delete `events.sent` and the sender restarts at the END of the file, never replaying history |
 | Refusal & violation evidence | `dataset/alarms/images/` | never training data |
+| On-site recordings | `recordings/<YYYYmmdd_HHMMSS>.mkv` + `.jsonl` (gitignored) | the page's 「● 錄影」 / 「錄影檔」 (`scripts/recorder.py`, 2026-10-08): the camera's H.264 stream copied as it arrives (native 2592×1944, 30 fps, no decode, ~0.2 core, ~3-7 GB/hour depending on motion) on its own RTSP session, plus a JSON-lines log — `start` (settings in force), `video_start` (wall time of video t=0), a `tick` every 0.1 s (detections in gate-frame px, person track IDs, subject, dwell, outcome), `check`, `alarm`, `visit`, `stop`. MKV, not MP4: a recording cut off by a crash/restart still read 143/150 frames vs 32 for fragmented MP4. Stops itself after 1 h or under 2 GB free; won't start under 5 GB. Downloaded via `/recordings/<name>` (names matched against `recorder.NAME_RE`, never a path). Site footage — the operator's data |
 | Model class names | the model checkpoint itself | *not* `data.yaml` — see gotchas |
 
 `config/gate.json` being runtime-written matters: **the UI overwrites it.** Do not
@@ -76,6 +77,7 @@ python3 scripts/test_ppe_check.py
 python3 scripts/test_visits.py        # in/out judgement: door side, edges, walking away
 python3 scripts/test_gate_light.py    # light policy + IT forms
 python3 scripts/test_whitelist.py
+python3 scripts/test_rfid_reader.py   # badge rule, per-antenna reads, antennas taking turns (simulator)
 
 # Syntax check after editing the big file
 python3 -c "import ast; ast.parse(open('scripts/gate_server.py').read())"
@@ -87,6 +89,9 @@ python3 -c "import ast; ast.parse(open('scripts/gate_server.py').read())"
 # a full-screen layer over the developer page, fed by three hooks in app.js
 # (window.demoResult in paintSummary, window.demoAlarm in paintAlarm, window.DEMO_ON in
 # liveTick). It reads, never decides; the developer page keeps running underneath.
+# Its Tag ID is ONE badge, the strongest (last_event epcs[0]); a newer trigger event than
+# the result it holds drops that result for good (2026-10-08: it showed the previous
+# worker's ID and OK/NG through the next check, and through an 「ID讀取失敗」).
 
 # Run the real gate
 ./run_gate_native.sh
@@ -141,7 +146,9 @@ makes *every* check fail. Currently `Bodycam` is in that state.
 
 **Inference is not the bottleneck.** ~50 ms/frame on the engine. A measured tap is ~0.71 s:
 ~250 ms inference, ~64 ms JPEG encoding, and ~320 ms of *deliberate* sleeping between
-burst frames. Do not reach for the model to make taps faster — and do not shrink
+burst frames. Image-trigger checks now vote on the dwell's last `burst_before` (3) ticks
+plus 2 new frames (`_pre_frames`, 2026-10-07): 0.36-0.43 s vs 0.69-0.79 s for 5 new in the
+same sandbox; at least one frame is always new. Do not reach for the model to make taps faster — and do not shrink
 `--burst-interval` below ~0.08 s: the camera only produces a new frame every ~40-80 ms, so
 faster sampling repeats frames and the vote stops being corroboration.
 
@@ -212,15 +219,30 @@ empties See Records. Add columns; don't reorder or rename them.
       image's right — but the operator turned the camera's **mirror** on, so on the live
       gate it is **left** (set 2026-10-02). Mirroring flips only left/right; walking
       towards / away from the camera is unaffected. Confirm on site by watching a worker
-      walk to the door.
+      walk to the door. **「左 & 右」 (`both`, 2026-10-09)**: the door is at the camera's end
+      and the band's two sides are its walls — out of either side is 出場, leaving by
+      either side is going in (`_is_door`).
+    - **Out of the door = big at first sight** (2026-10-09): a door-side sighting counts as
+      coming out of the door only when the box is already ≥ min(1, `exit_area_fraction`) ×
+      AREA_TH there and the track was never smaller than that before (`was_small`) — the
+      door is at the camera, someone walking up the hall along that side starts small
+      (2026-10-08 recording #240). Same knob as below; above 1 it only raises the check bar.
     - **Side-on exits** (2026-10-03, `exit_area_fraction`, default 0.6, the 「出場（門那側來）×」
       box next to the area threshold): a track that came from the door's side starts its
       出場 visit at that fraction of AREA_TH — a worker stepping out of the door is
       side-on (~55-65 % of a front-on box) and never reached AREA_TH, so walking out
-      unchecked went unreported. Entering visits keep the full AREA_TH. "Came from" is
+      unchecked went unreported. Entering visits keep the full AREA_TH. **Above 1**
+      (range 0.2–2.0 since 2026-10-09, operator: a worker leaving comes out by the door near
+      the camera and walks away, box big → small) it raises the bar instead: a door-side
+      track must reach that × AREA_TH both to start its visit and to count for the dwell /
+      crowd rule (`_gate_area`); below 1 the check still needs the plain AREA_TH. Above 1 a
+      door-side worker who never gets that big is not followed at all. "Came from" is
       remembered per track (`came_from`, the last non-band side) rather than read off the
       tick before the band; small in the middle of the frame (far down the entrance path)
-      wipes it. The walk-away / edge-crossing line is `_away_line`: `away_fraction`
+      wipes it, and so does a visit ending by walking away (`via: "away"`, 2026-10-09: a
+      worker who came out of the door, walked off far enough to count as gone and came
+      back kept "from the door", so walking back INTO the door read as "back" — the
+      2026-10-08 recording's #242, replayed in test_visits.py section 24). The walk-away / edge-crossing line is `_away_line`: `away_fraction`
       (default 0.5, the page's 「走遠線 ×」, 0.3-0.8 — the operator raised the cap from 0.7 on
       2026-10-04; above ~0.7 a worker turning side-on to the door can read as walking off) of the visit's own peak area, capped
       at that fraction of AREA_TH (so front-on visits use the plain line). A shallow room
@@ -286,21 +308,42 @@ empties See Records. Add columns; don't reorder or rename them.
     - Two person boxes must persist for `CROWD_CONFIRM_S` (0.65 s) before the crowd
       refusal fires; each refusal journals every box with its IoU/containment against
       the largest, the data a same-person de-dup threshold would be tuned from.
-    - **RFID power / receive mode** are set live from the 「See RFID read」 popup
-      (`RfidService.reconfigure`, on the reader thread: abort → mode → start at the new
-      power; a refusal arrives as an "inventory ended" error and the old values are put
-      back). Default 20 dBm / mode 103 (最快, hears ≥ −68 dBm only — so an RSSI floor below
+    - **RFID power / receive mode** are set live from the 「See RFID read」 popup, **one row
+      per antenna** since 2026-10-07 (`RfidService.reconfigure(power, mode, antenna)`, on
+      the reader thread: abort → mode → a run on that antenna at the new values; a refusal
+      arrives as an "inventory ended" error and that antenna's old values are put back).
+      Every run command carries its own antenna's power and mode, so the two can differ;
+      the mode sent with 0x64 at connect is only the reader's default. Default 20 dBm / mode 103 (最快, hears ≥ −68 dBm only — so an RSSI floor below
       −68 changes nothing in that mode); 285 (最靈敏) hears ≥ −83 dBm. The real reader
       ACCEPTED 25–33 dBm on 2026-10-01 — acceptance is not proof it transmits that much.
-    - Dwell satisfied → the one-tag rule, looking **back** `--rfid-before` (3 s) from
-      that moment: exactly one tag whose peak RSSI in the window is ≥
-      `cfg.rfid_min_rssi` → check with that EPC; none → `RFID_fail.mp3`; two or more →
-      `multi-person-detected.mp3`. **Every refusal speaks, flashes and is recorded, every
-      time** (operator: 每一次的檢測都要有語音) — there is no repeat suppression any more;
-      a refused worker who stays hears it again each ~4 s cycle and stays under red.
+    - Dwell satisfied → the badge rule (`rfid_reader.pick_worker`), looking **back**
+      `--rfid-before` (3 s) from that moment: of the tags whose peak RSSI in the window
+      is ≥ `cfg.rfid_min_rssi`, the **strongest** is the worker → check with that EPC;
+      none → 「ID讀取失敗」. Two or more used to refuse (「檢測口請淨空」, MULTI_TAG) —
+      removed 2026-10-07 at the operator's request: with two antennas across the walkway
+      the next worker in line was heard above the floor so often that the gate kept
+      refusing. Accepted risk: when two badges are close in strength the check can carry
+      the wrong name (to the records, the whitelist check and IT); every badge heard
+      stays in the row's `rfid_tags` for audit, and the journal says by how many dB the
+      strongest won. Two PEOPLE in the door zone (the camera's crowd rule) still refuse.
+    - **Two antennas** (2026-10-07): `--rfid-antenna 1,3` (systemd unit). The run command
+      names ONE antenna port, so several take turns, `RfidService.ANT_DWELL_S` (0.25 s)
+      each, the next starting the moment the last ends (`_ended`). Every read keeps its
+      antenna; a badge's strength is its peak over all of them (the union), and the
+      per-antenna peaks go to `rfid_tags` (`[A1 -62 / A3 -48]`) and the 「See RFID
+      read」 popup, for calibrating the two. `scripts/rfid_antenna_test.py` shows both
+      side by side live (stop the gate first: the box takes one client).
+    - **Every refusal flashes and is recorded, every time; its VOICE is said once per 5 s
+      per visit** for the four that repeat — 「ID讀取失敗」「ID未登入」「檢測未通過」「檢測口請淨空」
+      (`say_to`, `VOICE_REPEAT_S`; operator 2026-10-07, replacing 09-30's 每一次的檢測都要有
+      語音 — on site half of those four came within 6 s of the same words, up to 20 in a
+      row). Same visit = track ID + when the visit started (`started`): another person,
+      different words, or walking off and coming back speak at once; PASS and every
+      violation always speak; no track ID (button, sensor) always speaks. A refused
+      worker who stays is re-checked every ~2 s and hears it every ~6 s (sandbox).
       `[visit] #N out of view mid-visit, last seen at cx=…` in the journal marks a visitor
       who vanished before crossing an edge — how a walk-in close to the camera is missed.
-    - Exactly one tag, but not in `config/whitelist.json` → **UNREGISTERED**:
+    - The chosen (strongest) tag not in `config/whitelist.json` → **UNREGISTERED**:
       `ID_not_registered.mp3` (「ID未登入」, a generated placeholder — replace freely,
       same name), a 5 s red flash on the tower, an UNREGISTERED row + frame, and —
       unlike every other refusal — **reported to IT** (ppeResult=Fail, items empty, that
@@ -309,10 +352,14 @@ empties See Records. Add columns; don't reorder or rename them.
       path do not.
     - Cooldown depends on the verdict: PASS opens a **5 s window** (green flashing) that
       ends early when the worker goes through (far edge, or walks away for 出場); still there at 5 s →
-      yellow flash and the normal re-check. FAIL 0.5 s, refusals 2 s.
+      yellow flash and the normal re-check. FAIL 0.5 s; 「ID讀取失敗」 / 「ID未登入」 0.5 s too
+      (2026-10-07, `IMAGE_TRIGGER_COOLDOWN_ID_S`: measured ~2.0 s between repeats in a
+      sandbox, vs 3-5 s before — about as long as id_read_fail.mp3, 2.09 s; whether the
+      tower cuts a playing voice off for the next one is unmeasured); crowd and reader
+      down 2 s.
     - **The light** (operator's definitions, `scripts/gate_light.py`): green steady =
       open/idle, yellow steady = checking (dwell or burst), green flash = PASS window,
-      yellow flash = warning (crowd, two badges, passed but did not go), red flash =
+      yellow flash = warning (crowd, passed but did not go), red flash =
       fail (no tag, unregistered, PPE FAIL, walked in), red steady = closed (camera
       dead, reader disconnected, trigger off, model swapping). The gate re-sends it
       every second with the tower's restore timer as a dead-man switch: the base is
@@ -321,7 +368,7 @@ empties See Records. Add columns; don't reorder or rename them.
       are overwritten within a second; the Speaker test goes through the policy.
     - **Voices** come from the tower (`say()`): PASS 「檢測通過」 (spoken since the
       evening of 2026-09-30); NO_WORKER is silent; FAIL
-      「檢測未通過」; crowd and two badges 「檢測口請淨空」; no tag 「ID讀取失敗」;
+      「檢測未通過」; crowd (two people in the zone) 「檢測口請淨空」; no tag 「ID讀取失敗」;
       unregistered 「ID未登入」; reader down is silent (the light is red steady).
       There is NO "reader deaf" rule (closed after N badge-less people in a row) — removed
       at the operator's request on 2026-10-05: nobody may carry a badge on site, and the
@@ -341,7 +388,8 @@ empties See Records. Add columns; don't reorder or rename them.
       (crowd: the largest box; violation: the crossing box; RFID refusals: the visit's
       last box, which also fills their `person_box` now). See Records shows them as
       「Person (px² · score)」; older rows got their area backfilled from `person_box`.
-      Refusals are rows too (status CROWD / MULTI_TAG / NO_TAG / READER_DOWN), with
+      Refusals are rows too (status CROWD / NO_TAG / READER_DOWN; MULTI_TAG until
+      2026-10-07), with
       their frame in `dataset/alarms/images/` — evidence, never training data.
     - **In/out source is a kiosk switch** (`gate.json` `direction_source`, UI 「進出場判斷」):
       `it` (default) — IT's access_type decides, as below; `track` — our bbox track
@@ -373,7 +421,10 @@ empties See Records. Add columns; don't reorder or rename them.
       only entries were; `it_report.through_without_pass`), so after a FAIL an exit is two
       posts too. There is no in/out field yet (operator: ignore for now), so IT cannot
       tell an exit violation from an entry one.
-      The kiosk's **IT Report** button switches it on/off and persists to
+      The kiosk's **IT Report** button switches it on/off (ON takes a SECOND click on the
+      button — 「再按一次：開始上報 IT」, 4 s — not a confirm() dialog: a browser that
+      suppresses dialogs answered Cancel silently and the button did nothing, 2026-10-09)
+      and persists to
       `config/it.json`; switching ON reports from that moment (no replay of what
       happened while off), whereas a service restart with it ON delivers what waits.
       The TSMC test domain does not resolve on the bench LAN — real delivery can only
@@ -387,6 +438,16 @@ empties See Records. Add columns; don't reorder or rename them.
     (v2.1.0) via `scripts/rfid_reader.py`. `scripts/rfid.py` is the retired badge-tap
     abstraction — delete rather than extend.
 - Phase 3 (on-site dataset collection) — working; discards no-worker captures.
+  - **Realtime samples are the camera's native 5 MP (2592×1944)** (2026-10-07): while the
+    page polls `/api/realtime`, a SECOND RTSP session decodes unscaled (`_camera_full`,
+    `full_frame()`), opened by the first poll and closed ~10 s after the last
+    (`REALTIME_FULL_IDLE_S`). Realtime detects and saves on it; the preview and the boxes
+    sent to the page are scaled back to the gate frame, so the page and its px² slider are
+    unchanged. Nothing is saved during the ~1 s the stream takes to open
+    (`sample_size: null`, 「5MP stream starting…」). The gate's own pipeline, checks, alarm
+    photos and every px² threshold stay 1280×960. Measured in a sandbox: realtime round
+    trip 310 ms vs 226 ms at 1280, server CPU ~217 % vs ~119 %, the gate's own frame age
+    unchanged (0.02 s). `--realtime-gate-res` restores the old behaviour.
 - A maintainability refactor is in progress. Done: these docs, named constants, and
   extracting the web UI from a Python string into `web/`. Next: route dispatch tables,
   splitting `gate_server.py` into modules, and replacing `_state` with a typed object.

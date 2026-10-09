@@ -18,7 +18,7 @@
       "negatives": [
         "no-harness"
       ],
-      "conf": 0.66
+      "conf": 0.65
     },
     {
       "label": "Bodycam",
@@ -33,23 +33,35 @@
     }
   ],
   "person_class": "person",
-  "person_conf": 0.7,
+  "person_conf": 0.75,
   "frames": 5,
   "votes_required": 2,
   "containment": 0.5,
   "negative_veto": true,
-  "trigger_min_area": 200000,
-  "rfid_min_rssi": -65.0,
+  "trigger_min_area": 190000,
+  "rfid_min_rssi": -60.0,
   "trigger_zone": [
-    0.288,
-    0.67
+    0.377,
+    0.777
   ],
   "model": "lite_1006_0008.engine",
-  "direction_source": "it",
-  "rfid_power_dbm": 14.0,
-  "rfid_rf_mode": 302,
-  "door_side": "left",
+  "direction_source": "track",
+  "rfid_power_dbm": 19.0,
+  "rfid_rf_mode": 103,
+  "door_side": "both",
   "track_person_conf": 0.6,
-  "exit_area_fraction": 0.9,
-  "away_fraction": 0.7
+  "exit_area_fraction": 1.0,
+  "away_fraction": 0.8,
+  "rfid_antenna_settings": {
+    "1": {
+      "power_dbm": 19.0,
+      "rf_mode": 103
+    },
+    "3": {
+      "power_dbm": 19.0,
+      "rf_mode": 103
+    }
+  },
+  "image_dwell": 0.5,
+  "burst_before": 3
 }

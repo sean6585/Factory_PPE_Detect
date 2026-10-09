@@ -19,3 +19,6 @@ it_mock_data/
 *.bak
 __pycache__/
 *.pyc
+
+# On-site recordings (scripts/recorder.py): video + decision logs, gigabytes, site footage
+recordings/

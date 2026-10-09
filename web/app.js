@@ -115,7 +115,7 @@ async function saveArea(){
 $("areaSlider").onchange = saveArea;
 $("areaNum").onchange = saveArea;
 
-// ── RFID one-person threshold (dBm) ─────────────────────────────────────
+// ── RFID badge threshold (dBm) ──────────────────────────────────────────
 // The image trigger counts tags whose peak RSSI in the last few seconds is at least
 // this. Exactly one → that worker is checked; none → RFID_fail.mp3; two or more →
 // multi-person-detected.mp3. Saved to gate.json like the area slider.
@@ -201,7 +201,8 @@ function positionZoneOverlay(){
   $("zoneEdgeL").style.left = (l * 100) + "%";
   $("zoneEdgeR").style.left = (r * 100) + "%";
   $("doorMark").className = "doorMark " + DOOR_SIDE;
-  $("doorMark").textContent = DOOR_SIDE === "left" ? "◀ 門 · 管制區" : "門 · 管制區 ▶";
+  $("doorMark").textContent = {left: "◀ 門 · 管制區", right: "門 · 管制區 ▶",
+                               both: "◀ 門 · 管制區（左右兩側） ▶"}[DOOR_SIDE] || "門 · 管制區";
   ov.classList.add("on");
 }
 
@@ -470,6 +471,7 @@ function applyThresholdsFromCfg(){
   }
   if (CFG.cfg.exit_area_fraction != null) EXIT_FRAC = Number(CFG.cfg.exit_area_fraction);
   if (CFG.cfg.away_fraction != null) AWAY_FRAC = Number(CFG.cfg.away_fraction);
+  paintDwell(CFG.cfg.image_dwell);
   if (CFG.cfg.trigger_min_area != null){
     AREA_MIN = Number(CFG.cfg.trigger_min_area);
     if (AREA_MIN > Number($("areaSlider").max)) $("areaSlider").max = AREA_MIN;
@@ -731,6 +733,29 @@ function paintDirSource(s){
   hint.hidden = !noIT;
   hint.textContent = noIT ? "IT Report 關閉中：暫用軌跡方向" : "";
 }
+// ── how long a person stands in the door zone before the check runs ─────────
+// gate.json image_dwell (the server clamps and saves it; --image-dwell is only the start).
+function paintDwell(sec){
+  if (sec == null || document.activeElement === $("dwellSec")) return;
+  $("dwellSec").value = Number(sec).toFixed(1);
+}
+$("dwellSec").onkeydown = e => { if (e.key === "Enter") $("dwellSec").blur(); };
+$("dwellSec").onchange = async () => {
+  const v = Number($("dwellSec").value);
+  try{
+    if (isNaN(v)) throw new Error("not a number");
+    const r = await fetch("/api/image_dwell", {method: "POST",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify({seconds: v})});
+    const d = await r.json().catch(() => ({error: `HTTP ${r.status}`}));
+    if (!r.ok || d.error) throw new Error(d.error || `HTTP ${r.status}`);
+    if (CFG) CFG.cfg.image_dwell = d.image_dwell;
+    paintDwell(d.image_dwell);
+  }catch(e){
+    $("err").textContent = "Could not save the dwell time: " + e.message;
+    if (CFG) paintDwell(CFG.cfg.image_dwell);
+  }
+};
+
 // ── which side of the picture the door is on ────────────────────────────
 let DOOR_BUSY = false;
 function paintDoorSide(s){
@@ -835,10 +860,13 @@ async function pollIT(){
 // IT reporting status — every 5 s is plenty; the heartbeat itself is every 30 s.
 let IT_BUSY = false;
 
+let IT_ON = false, IT_ARM_TIMER = null;
 function paintITButton(s){
   const btn = $("itEnable");
   if (!s.available){ btn.classList.add("hidden"); return; }
   btn.classList.remove("hidden");
+  IT_ON = !!s.enabled;
+  if (btn.classList.contains("arming")) return;     // waiting for the confirming click
   // Colours flipped relative to the sensor toggle: OFF here is a deliberate, ordinary
   // state (not yet commissioned), so it stays neutral; ON is what should be confirmed.
   btn.classList.toggle("on", !!s.enabled);
@@ -846,11 +874,28 @@ function paintITButton(s){
   btn.textContent = `IT Report: ${s.enabled ? "ON" : "OFF"}`;
 }
 
+// Switching ON takes a second click on the button itself, not a confirm() dialog. A
+// browser told to "prevent this page from creating additional dialogs" — or one that
+// blocks dialogs outright — answers confirm() with Cancel without showing anything, and
+// the button then silently did nothing: no request, no error (2026-10-09). OFF is one
+// click, as before.
+function disarmIT(){
+  clearTimeout(IT_ARM_TIMER); IT_ARM_TIMER = null;
+  $("itEnable").classList.remove("arming");
+}
 $("itEnable").onclick = async () => {
-  const want = $("itEnable").textContent.endsWith("OFF");
-  if (want && !confirm("Start sending PPE results and the device heartbeat to the site IT "
-                       + "service?\n\nReporting starts from now — nothing recorded while it "
-                       + "was off is sent.")) return;
+  const btn = $("itEnable"), want = !IT_ON;
+  if (want && !btn.classList.contains("arming")){
+    btn.classList.add("arming");
+    btn.textContent = "再按一次：開始上報 IT";
+    $("err").textContent = "IT Report：再按一次確認。從現在開始上報，關閉期間的紀錄不會補送。";
+    IT_ARM_TIMER = setTimeout(() => {
+      disarmIT(); btn.textContent = "IT Report: OFF"; $("err").textContent = "";
+    }, 4000);
+    return;
+  }
+  disarmIT();
+  $("err").textContent = "";
   IT_BUSY = true;
   try{
     const r = await fetch("/api/it_enable", {method: "POST",
@@ -1255,7 +1300,12 @@ async function rtTick(){
     const d = await r.json().catch(() => ({error:`HTTP ${r.status}`}));
     if (!r.ok || d.error) throw new Error(d.error || `HTTP ${r.status}`);
     rtShow(d);
-    $("rtInfo").textContent = `${d.saved_total} sample(s) saved · ${d.infer_ms} ms`;
+    // sample_size: what samples are saved at; null = the native-resolution stream is
+    // still opening and nothing is saved yet (absent on an older server).
+    const sz = d.sample_size === undefined ? ""
+             : d.sample_size ? ` · ${d.sample_size[0]}×${d.sample_size[1]}`
+             : " · 5MP stream starting…";
+    $("rtInfo").textContent = `${d.saved_total} sample(s) saved · ${d.infer_ms} ms${sz}`;
   }catch(e){
     $("err").textContent = "Realtime stopped: " + e.message;
     setRealtime(false);
@@ -2101,9 +2151,11 @@ function renderRfid(d){
     return;
   }
   const thr = Number(d.min_rssi);
+  const multiAnt = (d.antennas || []).length > 1;
   $("rfidSub").textContent = `${d.connected ? "reader connected" : "READER NOT CONNECTED"}`
+    + (d.antennas ? ` · antenna ${d.antennas.join(" + ")}` : "")
     + ` · last ${d.horizon_s}s · ${d.total_reads.toLocaleString()} reads since start`
-    + ` · one-person threshold ${fmtRssi(thr)} dBm`
+    + ` · threshold ${fmtRssi(thr)} dBm (strongest above it = the worker)`
     + ` · ${whitelistSummary(d.whitelist)}`;
   const near = d.rows.filter(r => r.rssi >= thr).length;
   $("rfidCount").textContent = d.rows.length
@@ -2117,7 +2169,9 @@ function renderRfid(d){
   }
   body.innerHTML = d.rows.map(r => `<tr>
       <td class="epc">${esc(r.epc)}</td>
-      <td class="num">${fmtRssi(r.rssi)} dBm</td>
+      <td class="num">${fmtRssi(r.rssi)} dBm${multiAnt && r.ants
+        ? "<br><small>" + Object.entries(r.ants).map(([a, v]) => `A${esc(a)} ${fmtRssi(v)}`).join(" · ")
+          + "</small>" : ""}</td>
       <td class="num">${fmtRssi(r.last_rssi)} dBm</td>
       <td class="num">${esc(r.reads)}</td>
       <td>${esc(r.first_seen)}</td>
@@ -2138,36 +2192,62 @@ function whitelistSummary(w){
   return `whitelist: ${w.count} ID(s)`;
 }
 
-// Transmit power and receive mode, set live on the reader (and saved). The reader is
-// the judge of what it supports: a refused value comes back as an error and the reader
-// keeps running on the previous settings.
+// Transmit power and receive mode PER ANTENNA (2026-10-07), set live on the reader (and
+// saved): one row for each antenna in use. The reader is the judge of what it supports:
+// a refused value comes back as an error and that antenna keeps its previous settings.
 async function loadRfidSettings(){
+  const box = $("rfidSets");
   try{
     const d = await (await fetch("/api/rfid_settings")).json();
-    if (!d.available){ $("rfidApply").disabled = true; $("rfidSetState").textContent = "no reader"; return; }
-    $("rfidPower").value = d.power_dbm;
-    $("rfidPower").min = d.power_range[0]; $("rfidPower").max = d.power_range[1];
-    $("rfidMode").innerHTML = d.modes.map(m =>
+    if (!d.available){
+      box.innerHTML = `<div class="sheetActions rfidSet"><span class="tag">no reader</span></div>`;
+      return;
+    }
+    const opts = d.modes.map(m =>
       `<option value="${m.value}">${esc(m.label)}（可聽到 ${esc(m.sensitivity)}）</option>`).join("");
-    $("rfidMode").value = d.rf_mode;
-    $("rfidSetState").textContent = `目前 ${d.power_dbm} dBm`;
-  }catch(e){ $("rfidSetState").textContent = "✗ " + e.message; }
+    box.innerHTML = d.antennas.map(a => `<div class="sheetActions rfidSet">
+        <span class="tag rfidAnt">天線 ${a.antenna}</span>
+        <label for="rfidPower${a.antenna}">發射功率</label>
+        <input type="number" id="rfidPower${a.antenna}" min="${d.power_range[0]}"
+               max="${d.power_range[1]}" step="0.5" value="${a.power_dbm}">
+        <span>dBm</span>
+        <label for="rfidMode${a.antenna}">接收模式</label>
+        <select id="rfidMode${a.antenna}">${opts}</select>
+        <button id="rfidApply${a.antenna}">套用</button>
+        <span class="tag" id="rfidSetState${a.antenna}">目前 ${a.power_dbm} dBm</span>
+      </div>`).join("");
+    d.antennas.forEach(a => {
+      $(`rfidMode${a.antenna}`).value = a.rf_mode;
+      $(`rfidApply${a.antenna}`).onclick = () => applyRfidSettings(a.antenna);
+    });
+  }catch(e){
+    box.innerHTML = `<div class="sheetActions rfidSet"><span class="tag">✗ ${esc(e.message)}</span></div>`;
+  }
 }
-$("rfidApply").onclick = async () => {
-  const st = $("rfidSetState");
-  $("rfidApply").disabled = true; st.textContent = "套用中…";
+async function applyRfidSettings(ant){
+  const st = $(`rfidSetState${ant}`), btn = $(`rfidApply${ant}`);
+  btn.disabled = true; st.textContent = "套用中…";
   try{
     const r = await fetch("/api/rfid_settings", {method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({power_dbm: Number($("rfidPower").value), rf_mode: Number($("rfidMode").value)})});
+      body: JSON.stringify({antenna: ant, power_dbm: Number($(`rfidPower${ant}`).value),
+                            rf_mode: Number($(`rfidMode${ant}`).value)})});
     const d = await r.json().catch(() => ({error: `HTTP ${r.status}`}));
     if (!r.ok || d.error) throw new Error(d.error || `HTTP ${r.status}`);
     st.textContent = `✓ 已套用 ${d.power_dbm} dBm`;
   }catch(e){ st.textContent = "✗ " + e.message; }
-  finally{ $("rfidApply").disabled = false; loadRfidSettingsQuiet(); }
-};
+  finally{ btn.disabled = false; loadRfidSettingsQuiet(); }
+}
+// Put back what the reader is really running on (after a refusal, the old values).
 async function loadRfidSettingsQuiet(){
-  try{ const d = await (await fetch("/api/rfid_settings")).json();
-       if (d.available){ $("rfidPower").value = d.power_dbm; $("rfidMode").value = d.rf_mode; } }catch(e){}
+  try{
+    const d = await (await fetch("/api/rfid_settings")).json();
+    if (!d.available) return;
+    d.antennas.forEach(a => {
+      const p = $(`rfidPower${a.antenna}`), m = $(`rfidMode${a.antenna}`);
+      if (p) p.value = a.power_dbm;
+      if (m) m.value = a.rf_mode;
+    });
+  }catch(e){}
 }
 
 $("rfidBtn").onclick = openRfid;
@@ -2322,5 +2402,58 @@ document.addEventListener("keydown", e => {
     if (LAST) draw(LAST);
   }
 });
+
+// ── on-site recording (scripts/recorder.py) ──────────────────────────────────
+// The camera stream as it arrives plus a log of what the gate decided every tick, for
+// replaying a real day at the gate. The server owns the recording; this only starts,
+// stops and shows it — another kiosk sees the same state within a few seconds.
+let VID = null, VID_BUSY = false;
+const fmtMB = b => b >= 1024 ** 3 ? (b / 1024 ** 3).toFixed(2) + " GB" : Math.round(b / 1024 ** 2) + " MB";
+const fmtDur = s => { s = Math.round(s); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
+const fmtStamp = n => `${n.slice(0, 4)}-${n.slice(4, 6)}-${n.slice(6, 8)} ${n.slice(9, 11)}:${n.slice(11, 13)}:${n.slice(13, 15)}`;
+function paintVid(d){
+  VID = d;
+  const b = $("vidBtn");
+  if (!d || !d.available){ b.disabled = true; b.textContent = "● 錄影"; return; }
+  b.disabled = VID_BUSY;
+  b.classList.toggle("on", !!d.active);
+  b.textContent = d.active ? `■ 停止錄影 ${fmtDur(d.elapsed || 0)} · ${fmtMB(d.bytes || 0)}` : "● 錄影";
+}
+async function pollVid(){
+  try{ paintVid(await (await fetch("/api/recording")).json()); }catch(e){}
+  setTimeout(pollVid, VID && VID.active ? 1000 : 5000);
+}
+$("vidBtn").onclick = async () => {
+  if (!VID || VID_BUSY) return;
+  VID_BUSY = true;
+  const b = $("vidBtn");
+  b.disabled = true; b.textContent = VID.active ? "停止中…" : "開始中…";
+  try{
+    const r = await fetch("/api/recording", {method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({on: !VID.active})});
+    const d = await r.json().catch(() => ({error: `HTTP ${r.status}`}));
+    if (!r.ok || d.error) throw new Error(d.error || `HTTP ${r.status}`);
+    VID_BUSY = false; paintVid(d);
+  }catch(e){ $("err").textContent = "Recording: " + e.message; VID_BUSY = false; paintVid(VID); }
+};
+async function openVid(){
+  $("vidModal").classList.add("on");
+  $("vidErr").textContent = "";
+  try{
+    const d = await (await fetch("/api/recordings")).json();
+    if (!d.available){ $("vidSub").textContent = "no camera on this server"; $("vidBody").innerHTML = ""; return; }
+    $("vidSub").textContent = `${d.dir} · 影片 .mkv 用 VLC 播 · .jsonl 是每 0.1 秒的辨識框與判斷`;
+    $("vidBody").innerHTML = d.rows.length ? d.rows.map(r => `<tr>
+        <td>${esc(fmtStamp(r.name))}${r.recording ? ' <span class="pill unreg">錄影中</span>' : ""}</td>
+        <td class="num">${r.seconds != null ? fmtDur(r.seconds) : "&mdash;"}</td>
+        <td class="num">${fmtMB(r.bytes)}</td>
+        <td><a href="/recordings/${esc(r.video)}" download>${esc(r.video)}</a></td>
+        <td>${r.log ? `<a href="/recordings/${esc(r.log)}" download>${esc(r.log)}</a>` : "&mdash;"}</td>
+      </tr>`).join("") : `<tr><td colspan="5" id="recEmpty">還沒有錄影。</td></tr>`;
+  }catch(e){ $("vidErr").textContent = "Could not list recordings: " + e.message; }
+}
+$("vidListBtn").onclick = openVid;
+$("vidClose").onclick = () => $("vidModal").classList.remove("on");
+pollVid();
 
 boot();
